@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VPN-монитор Cisco</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Auth overlay -->
+  <div id="auth" class="auth hidden">
+    <form id="auth-form" class="auth-card">
+      <div class="brand brand-lg"><span class="brand-mark"></span><div><b>VPN-монитор</b><small>Cisco AnyConnect</small></div></div>
+      <h1 id="auth-title">Вход</h1>
+      <p id="auth-hint" class="muted"></p>
+      <label id="auth-login-wrap">Логин<input id="auth-login" autocomplete="username" placeholder="admin"></label>
+      <label>Пароль панели<input id="auth-password" type="password" autocomplete="current-password" required></label>
+      <label id="auth-confirm-wrap" class="hidden">Повторите пароль<input id="auth-confirm" type="password" autocomplete="new-password"></label>
+      <p id="auth-error" class="error-text"></p>
+      <button class="btn primary wide" type="submit" id="auth-submit">Войти</button>
+    </form>
+  </div>
+
+  <div id="shell" class="shell hidden">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark"></span><div><b>VPN-монитор</b><small>Cisco AnyConnect</small></div></div>
+      <nav id="nav">
+        <a href="#/overview" data-view="overview"><span class="ico">◧</span>Обзор</a>
+        <a href="#/sessions" data-view="sessions"><span class="ico">⇄</span>Сессии<span class="badge" id="nav-sessions">0</span></a>
+        <a href="#/audit" data-view="audit"><span class="ico">☷</span>Аудит пользователей</a>
+        <a href="#/accounts" data-view="accounts"><span class="ico">⌫</span>Учётки на удаление</a>
+        <a href="#/events" data-view="events"><span class="ico">≡</span>Журнал<span class="badge alert hidden" id="nav-alerts">0</span></a>
+        <a href="#/routerlog" data-view="routerlog"><span class="ico">⌁</span>Журнал роутера</a>
+        <a href="#/settings" data-view="settings"><span class="ico">⚙</span>Настройки</a>
+      </nav>
+      <div class="sidebar-foot">
+        <div id="collector-status" class="collector"><span class="dot"></span><span class="txt">Подключение…</span></div>
+        <div class="whoami" id="whoami"></div>
+        <div class="foot-actions">
+          <button class="btn ghost sm" id="theme-toggle" type="button" title="Сменить тему">◐ Тема</button>
+          <button class="btn ghost sm" id="logout" type="button">Выйти</button>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="view-title">Обзор</h1>
+          <div class="muted small" id="view-sub"></div>
+        </div>
+        <div class="top-actions">
+          <span class="muted small" id="last-poll"></span>
+          <button class="btn" id="refresh-btn" type="button">↻ Обновить</button>
+        </div>
+      </header>
+
+      <div id="banner" class="banner hidden"></div>
+
+      <!-- Overview -->
+      <section class="view" id="view-overview">
+        <div class="kpis">
+          <div class="kpi"><span>Активных сессий</span><b id="k-sessions">—</b><small id="k-sessions-sub"></small></div>
+          <div class="kpi"><span>Пользователей онлайн</span><b id="k-users">—</b><small id="k-users-sub"></small></div>
+          <div class="kpi"><span>Пик за 7 дней</span><b id="k-peak">—</b><small id="k-peak-sub"></small></div>
+          <div class="kpi" id="k-alerts-card"><span>Тревоги за 24 ч</span><b id="k-alerts">—</b><small>вход из новой страны, несколько IP</small></div>
+        </div>
+        <div class="card routers-card hidden" id="routers-card">
+          <div class="card-head"><h2>Устройства</h2><a href="#/settings" class="link small">Настроить →</a></div>
+          <div class="router-chips" id="router-chips"></div>
+        </div>
+        <div class="grid-2">
+          <div class="card span-2">
+            <div class="card-head">
+              <h2>Одновременные сессии</h2>
+              <div class="seg" id="conc-range">
+                <button data-days="1">24 ч</button><button data-days="7" class="on">7 дней</button><button data-days="30">30 дней</button><button data-days="90">90 дней</button>
+              </div>
+            </div>
+            <div id="conc-chart" class="chart"></div>
+            <p class="muted small chart-note" id="conc-note"></p>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>Последние события</h2><a href="#/events" class="link small">Весь журнал →</a></div>
+            <ul id="recent-events" class="event-list compact"></ul>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>Сейчас в сети</h2><a href="#/sessions" class="link small">Все сессии →</a></div>
+            <ul id="online-list" class="online-list"></ul>
+          </div>
+          <div class="card span-2">
+            <div class="card-head">
+              <h2>Клиенты AnyConnect</h2>
+              <span class="muted small" id="clients-sub"></span>
+            </div>
+            <div id="clients-list" class="client-groups"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Sessions -->
+      <section class="view hidden" id="view-sessions">
+        <div class="toolbar wrap">
+          <input id="s-search" class="search" type="search" placeholder="Поиск: логин, IP, страна, провайдер, версия…  ( / )">
+          <div class="seg hidden" id="s-router"></div>
+          <span class="muted small" id="s-count"></span>
+        </div>
+        <div class="card flush">
+          <div class="table-wrap">
+            <table class="table" id="s-table">
+              <thead><tr>
+                <th data-k="login">Пользователь</th>
+                <th data-k="router_name" class="col-router">Устройство</th>
+                <th data-k="ip">IP клиента</th>
+                <th data-k="country">Страна / город</th>
+                <th data-k="org">Провайдер</th>
+                <th data-k="client_version">Клиент</th>
+                <th data-k="packets" class="num" title="Принято / отправлено IP-пакетов через туннель">Пакеты ↓/↑</th>
+                <th data-k="connections" class="num">Туннели</th>
+                <th data-k="created_s" class="num">В сети</th>
+                <th data-k="last_used_s" class="num">Простой</th>
+                <th></th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="empty hidden" id="s-empty">Нет активных сессий</div>
+        </div>
+      </section>
+
+      <!-- Audit -->
+      <section class="view hidden" id="view-audit">
+        <div class="toolbar wrap">
+          <div class="seg" id="a-period">
+            <button data-days="7">7 дн.</button><button data-days="30" class="on">30 дн.</button><button data-days="60">60 дн.</button><button data-days="90">90 дн.</button><button data-days="180">180 дн.</button>
+          </div>
+          <div class="seg" id="a-filter">
+            <button data-f="all" class="on">Все <i id="a-c-all"></i></button><button data-f="active">Активные <i id="a-c-active"></i></button><button data-f="inactive">Неактивные <i id="a-c-inactive"></i></button><button data-f="online">В сети <i id="a-c-online"></i></button><button data-f="unstable" title="Частые переподключения — обычно признак плохого канала">Нестабильные <i id="a-c-unstable"></i></button><button data-f="outdated" title="Версия AnyConnect ниже минимальной из настроек">Устаревший клиент <i id="a-c-outdated"></i></button>
+          </div>
+          <input id="a-search" class="search sm" type="search" placeholder="Поиск логина…">
+          <div class="spacer"></div>
+          <button class="btn admin-only" id="a-import" type="button">+ Импорт</button>
+          <a class="btn" id="a-export" href="#">⤓ CSV</a>
+        </div>
+        <div class="card flush">
+          <div class="table-wrap">
+            <table class="table" id="a-table">
+              <thead><tr>
+                <th class="chk"><input type="checkbox" id="a-all" aria-label="Выбрать всех"></th>
+                <th data-k="status">Статус</th>
+                <th data-k="login">Пользователь</th>
+                <th data-k="connects_period" class="num">Сессий</th>
+                <th data-k="active_days" class="num">Дней</th>
+                <th data-k="work_seconds" class="num">Время работы</th>
+                <th data-k="unique_ips" class="num">IP</th>
+                <th data-k="reconnects_peak_day" class="num" title="Переподключений за период (максимум за один день)">Переподкл.</th>
+                <th data-k="client_version">Клиент</th>
+                <th data-k="last_connected">Последняя активность</th>
+                <th data-k="days_idle" class="num">Без входа</th>
+                <th data-k="last_country">Откуда</th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="selection-bar hidden" id="a-selbar">
+          <span id="a-selcount"></span>
+          <button class="btn sm" id="a-copy" type="button">Копировать логины</button>
+          <button class="btn sm danger admin-only" id="a-remove" type="button">Убрать из списка</button>
+        </div>
+      </section>
+
+      <!-- Accounts cleanup -->
+      <section class="view hidden" id="view-accounts">
+        <div class="card intro">
+          <p>Локальные учётки с роутеров, которыми не пользовались для VPN дольше заданного срока, и готовые команды для их удаления. <b>Панель ничего не меняет на роутере</b> — команды нужно проверить и выполнить самостоятельно.</p>
+          <div class="toolbar wrap">
+            <label class="inline">Без входа не меньше, дней <input id="c-days" type="number" min="7" class="narrow-input"></label>
+            <button class="btn" id="c-apply" type="button">Показать</button>
+            <div class="spacer"></div>
+            <button class="btn admin-only" id="c-sync" type="button">⇣ Обновить список учёток с роутеров</button>
+          </div>
+          <div class="admin-only">
+            <label>Никогда не предлагать к удалению (служебные учётки), через пробел или запятую
+              <input id="c-exclude" placeholder="например: svc_backup svc_1c scanner"></label>
+            <button class="btn sm" id="c-exclude-save" type="button">Сохранить исключения</button>
+          </div>
+        </div>
+        <div id="c-routers"></div>
+      </section>
+
+      <!-- Events -->
+      <section class="view hidden" id="view-events">
+        <div class="toolbar wrap">
+          <div class="seg" id="e-type">
+            <button data-t="" class="on">Все</button><button data-t="CONNECTED">Входы</button><button data-t="DISCONNECTED">Выходы</button><button data-t="ALERT">Тревоги</button><button data-t="ERROR">Ошибки</button><button data-t="GAP">Простои монитора</button><button data-t="CONFIG">Конфигурация роутера</button><button data-t="AUTH">Входы в панель</button><button data-t="ADMIN">Действия</button>
+          </div>
+          <input id="e-search" class="search sm" type="search" placeholder="Логин, IP или текст…">
+        </div>
+        <div class="card flush"><ul id="e-list" class="event-list"></ul><div class="empty hidden" id="e-empty">Событий нет</div></div>
+      </section>
+
+      <!-- Router syslog -->
+      <section class="view hidden" id="view-routerlog">
+        <div class="card syslog-status" id="sl-status"></div>
+        <div class="toolbar wrap">
+          <div class="seg" id="sl-kind">
+            <button data-k="" class="on">Все</button><button data-k="config">Изменения конфигурации</button><button data-k="config_cmd">Команды</button><button data-k="restart">Перезагрузки</button><button data-k="iface_down">Падения интерфейсов</button><button data-k="auth_fail">Неудачные входы</button>
+          </div>
+          <div class="seg" id="sl-sev">
+            <button data-s="7" class="on">Любая важность</button><button data-s="4">Предупреждения+</button><button data-s="3">Ошибки+</button>
+          </div>
+          <input id="sl-search" class="search sm" type="search" placeholder="Текст, код, адрес…">
+          <label class="switch inline"><input type="checkbox" id="sl-noise"><span></span>Показать туннели VPN</label>
+        </div>
+        <div class="code-chips" id="sl-codes"></div>
+        <div class="card flush"><ul id="sl-list" class="event-list syslog-list"></ul><div class="empty hidden" id="sl-empty">Сообщений нет</div></div>
+      </section>
+
+      <!-- Settings -->
+      <section class="view hidden" id="view-settings">
+        <div class="settings admin-only">
+          <div class="card span-all">
+            <div class="card-head"><h2>Устройства Cisco</h2><button class="btn sm primary" type="button" id="r-add">+ Добавить устройство</button></div>
+            <div class="table-wrap static">
+              <table class="table" id="r-table">
+                <thead><tr><th>Название</th><th>Адрес</th><th>SSH-логин</th><th>Состояние</th><th class="num">Сессий</th><th></th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <p class="muted small">SSH-ключ каждого устройства запоминается при первом подключении (файл <code>known_hosts</code>). Пароли хранятся зашифрованными для текущего пользователя Windows.</p>
+          </div>
+        </div>
+        <form id="settings-form" class="settings admin-only">
+          <div class="card">
+            <h2>Сбор данных</h2>
+            <div class="form-grid">
+              <label>Интервал опроса, сек<input name="refresh_seconds" type="number" min="10"></label>
+              <label>Хранить историю, дней<input name="retention_days" type="number" min="0"></label>
+              <label>Резервных копий базы, дней<input name="backup_keep_days" type="number" min="0" max="365" title="0 — не делать копии"></label>
+              <label>Обновлять данные клиента, мин<input name="client_details_refresh_minutes" type="number" min="0" title="0 — только при подключении"></label>
+              <label>Минимальная версия AnyConnect<input name="min_client_version" placeholder="4.10"></label>
+            </div>
+            <p class="muted small">Версия, ОС и пакеты берутся из <code>show webvpn session user … context …</code> при подключении и затем раз в указанный интервал. Клиенты ниже минимальной версии помечаются как устаревшие.</p>
+          </div>
+          <div class="card">
+            <h2>Тревоги</h2>
+            <label class="switch"><input type="checkbox" name="alert_new_country"><span></span>Вход из страны, откуда пользователь раньше не входил</label>
+            <label class="switch"><input type="checkbox" name="alert_multi_ip"><span></span>Один логин одновременно с разных IP</label>
+            <label class="switch"><input type="checkbox" name="alert_night_logins"><span></span>Ночные входы</label>
+            <div class="form-grid narrow">
+              <label>Ночь с, ч<input name="night_start_hour" type="number" min="0" max="23"></label>
+              <label>до, ч<input name="night_end_hour" type="number" min="0" max="23"></label>
+            </div>
+            <label class="switch"><input type="checkbox" name="alert_router_reboot"><span></span>Роутер перезагрузился (проверка show version раз в 15 минут)</label>
+            <label>Нестабильное соединение — от N переподключений за день<input name="unstable_reconnects_per_day" type="number" min="1" class="narrow-input"></label>
+            <p class="muted small">Переподключение — новая сессия не позже чем через 10 минут после окончания предыдущей.</p>
+          </div>
+          <div class="card">
+            <h2>Telegram</h2>
+            <label class="switch"><input type="checkbox" name="telegram_enabled"><span></span>Отправлять уведомления</label>
+            <div class="form-grid">
+              <label>Токен бота<input name="telegram_token" type="password" autocomplete="off" placeholder="не менять"></label>
+              <label>Chat ID<input name="telegram_chat_id"></label>
+            </div>
+            <label class="switch"><input type="checkbox" name="telegram_notify_alerts"><span></span>Тревоги и потеря связи с роутером</label>
+            <label class="switch"><input type="checkbox" name="telegram_notify_sessions"><span></span>Каждый вход и выход (много сообщений)</label>
+            <button class="btn sm" type="button" id="tg-test">Отправить тестовое сообщение</button>
+            <h3>Еженедельный отчёт</h3>
+            <label class="switch"><input type="checkbox" name="weekly_report_enabled"><span></span>Отправлять отчёт раз в неделю</label>
+            <div class="form-grid">
+              <label>День<select name="weekly_report_weekday" id="weekday-select"></select></label>
+              <label>Час<input name="weekly_report_hour" type="number" min="0" max="23"></label>
+            </div>
+            <p class="muted small" id="report-last"></p>
+            <div class="row-actions">
+              <button class="btn sm" type="button" id="report-preview">Предпросмотр</button>
+              <button class="btn sm" type="button" id="report-send">Отправить сейчас</button>
+            </div>
+          </div>
+          <div class="card">
+            <h2>Доступ к панели</h2>
+            <div class="form-grid">
+              <label>Откуда открывать
+                <select name="web_bind">
+                  <option value="127.0.0.1">Только с этого компьютера</option>
+                  <option value="0.0.0.0">С других компьютеров сети</option>
+                </select>
+              </label>
+              <label>Порт<input name="web_port" type="number" min="1024" max="65535"></label>
+            </div>
+            <label class="switch"><input type="checkbox" name="web_https"><span></span>HTTPS (самоподписанный сертификат создаётся автоматически)</label>
+            <div id="access-info" class="access-info"></div>
+            <button class="btn sm hidden" type="button" id="restart">Перезапустить сервер, чтобы применить</button>
+          </div>
+          <div class="card">
+            <h2>Журнал роутера (syslog)</h2>
+            <label class="switch"><input type="checkbox" name="syslog_enabled"><span></span>Принимать журнал роутера</label>
+            <div class="form-grid">
+              <label>UDP-порт<input name="syslog_port" type="number" min="1" max="65535"></label>
+              <label>Хранить, дней<input name="syslog_retention_days" type="number" min="1"></label>
+            </div>
+            <label>Не сохранять сообщения с кодами, начинающимися на<input name="syslog_ignore" placeholder="IPPHONE-6-"></label>
+            <label class="switch"><input type="checkbox" name="syslog_alert_restart"><span></span>Тревога: перезагрузка роутера</label>
+            <label class="switch"><input type="checkbox" name="syslog_alert_config"><span></span>Telegram: изменение конфигурации (кто и какие команды)</label>
+            <label class="switch"><input type="checkbox" name="syslog_alert_interfaces"><span></span>Тревога: падение физического интерфейса</label>
+            <label>Тревога: неудачных входов за 10 минут, не меньше<input name="syslog_auth_fail_threshold" type="number" min="1" class="narrow-input"></label>
+            <p class="muted small">Включение и порт применяются после перезапуска сервера.</p>
+          </div>
+          <div class="save-bar"><span class="muted small" id="settings-msg"></span><button class="btn primary" type="submit">Сохранить</button></div>
+        </form>
+        <div class="settings admin-only">
+          <div class="card span-all">
+            <div class="card-head"><h2>Пользователи панели</h2><button class="btn sm primary" type="button" id="u-add">+ Добавить пользователя</button></div>
+            <div class="table-wrap static">
+              <table class="table" id="u-table"><thead><tr><th>Логин</th><th>Роль</th><th></th></tr></thead><tbody></tbody></table>
+            </div>
+            <p class="muted small">«Только просмотр» видит сессии, аудит, журналы и учётки, но не может отключать сессии и менять настройки. Встроенный администратор входит с логином <code>admin</code> (или без логина).</p>
+          </div>
+        </div>
+        <div class="settings">
+          <form class="card" id="pw-form">
+            <h2>Пароль веб-панели</h2>
+            <div class="form-grid">
+              <label>Текущий<input name="current" type="password" autocomplete="current-password" required></label>
+              <label>Новый (от 8 символов)<input name="new" type="password" autocomplete="new-password" minlength="8" required></label>
+            </div>
+            <button class="btn sm" type="submit">Сменить пароль</button>
+          </form>
+          <div class="card admin-only">
+            <h2>Сервер</h2>
+            <p class="muted small" id="server-info"></p>
+            <h3>Резервные копии базы</h3>
+            <p class="muted small">Делаются автоматически раз в сутки в папку <code>backups</code> рядом с программой.</p>
+            <ul class="backup-list" id="backup-list"></ul>
+            <div class="row-actions">
+              <button class="btn sm" type="button" id="backup-now">Сделать копию сейчас</button>
+              <button class="btn sm danger" type="button" id="shutdown">Остановить сервер</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- User drawer -->
+  <div id="drawer" class="drawer hidden" aria-hidden="true">
+    <div class="drawer-backdrop" data-close></div>
+    <aside class="drawer-panel">
+      <header><div><h2 id="d-login"></h2><div class="muted small" id="d-sub"></div></div><button class="btn ghost" data-close type="button" aria-label="Закрыть">✕</button></header>
+      <div class="drawer-body">
+        <div class="mini-kpis" id="d-kpis"></div>
+        <h3>По месяцам</h3><div id="d-monthly" class="chart small"></div>
+        <h3>Сессии за 90 дней</h3>
+        <div class="table-wrap"><table class="table dense"><thead><tr><th>Вход</th><th>Выход</th><th class="num">Длит.</th><th>IP</th><th>Откуда</th><th>Клиент</th></tr></thead><tbody id="d-history"></tbody></table></div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Modal -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-card">
+      <h2 id="m-title"></h2>
+      <div id="m-body"></div>
+      <div class="modal-actions" id="m-actions"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>

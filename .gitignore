@@ -1,0 +1,34 @@
+# Working data: never commit it. It holds router credentials (encrypted), panel password
+# hashes, VPN user names and client IP addresses.
+settings.json
+*.db
+*.db-wal
+*.db-shm
+*.bak
+*.before-*
+ip_cache.json
+known_hosts
+*.log
+backups/
+tls/
+vpnmon-transfer-*.zip
+
+# Build output
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local tools and backups
+.claude/
+_backup*/
+.idea/
+.vscode/
+
+# Demo data from tools/make_demo.py
+demo/

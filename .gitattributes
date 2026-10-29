@@ -1,0 +1,6 @@
+* text=auto
+# Windows scripts must keep CRLF whatever the user's core.autocrlf is.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.png binary
+*.ico binary
