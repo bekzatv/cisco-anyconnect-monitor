@@ -27,6 +27,21 @@ def _date(ts: int | None) -> str:
     return datetime.fromtimestamp(ts).strftime("%d.%m.%Y") if ts else ""
 
 
+def mark_deleted_accounts(store: ConnectionStatsStore, routers: list[dict], rows: list[dict]) -> bool:
+    """Set row["deleted"] for logins that are no longer in any router's configuration.
+
+    Only when the account lists of all polled routers have been loaded: a router never synced
+    would make every one of its users look deleted. Users online right now are never "deleted".
+    Returns whether the check was possible.
+    """
+    active = [r for r in routers if r.get("enabled", True)]
+    ready = bool(active) and all(store.get_meta(f"router_users_synced:{r['id']}") for r in active)
+    present = store.router_logins() if ready else set()
+    for row in rows:
+        row["deleted"] = ready and not row.get("online") and row["login"].lower() not in present
+    return ready
+
+
 def build_cleanup(store: ConnectionStatsStore, routers: list[dict], idle_days: int,
                   exclude: set[str], now_ts: int | None = None) -> dict:
     now_ts = now_ts if now_ts is not None else int(time.time())

@@ -585,14 +585,18 @@ async function loadAudit() {
 function renderAudit() {
   const f = segValue("a-filter", "f");
   const q = $("#a-search").value.trim().toLowerCase();
-  const counts = { all: S.audit.length, active: 0, inactive: 0, online: 0, unstable: 0, outdated: 0 };
+  // Accounts already deleted on the routers keep their history but only show under their own filter.
+  const counts = { all: 0, active: 0, inactive: 0, online: 0, unstable: 0, outdated: 0, deleted: 0 };
   S.audit.forEach((u) => {
+    if (u.deleted) { counts.deleted++; return; }
+    counts.all++;
     counts[u.status === "ACTIVE" ? "active" : "inactive"]++;
     if (u.online) counts.online++;
     if (u.unstable) counts.unstable++;
     if (u.client_outdated) counts.outdated++;
   });
   for (const k in counts) $(`#a-c-${k}`).textContent = counts[k];
+  $("#a-f-deleted").classList.toggle("hidden", !counts.deleted && f !== "deleted");
   const match = {
     all: () => true,
     active: (u) => u.status === "ACTIVE",
@@ -600,13 +604,15 @@ function renderAudit() {
     online: (u) => u.online,
     unstable: (u) => u.unstable,
     outdated: (u) => u.client_outdated,
+    deleted: (u) => u.deleted,
   }[f] || (() => true);
-  let rows = S.audit.filter((u) => match(u) && (!q || `${u.login} ${personText(u.login)}`.toLowerCase().includes(q)));
+  let rows = S.audit.filter((u) => (f === "deleted" || !u.deleted) && match(u) && (!q || `${u.login} ${personText(u.login)}`.toLowerCase().includes(q)));
   rows = sortRows(rows, S.auditSort.key, S.auditSort.desc);
   markSorted($("#a-table"), S.auditSort);
   const days = segValue("a-period", "days");
   const down = S.auditDowntime?.total_seconds || 0;
   $("#view-sub").textContent = `Период: ${days} дн. · активных ${counts.active}, неактивных ${counts.inactive}`
+    + (counts.deleted ? ` · удалено с роутеров ${counts.deleted} (скрыты)` : "")
     + (down ? ` · монитор не работал ${fmtDur(down)} (${S.auditDowntime.count} раз) — данные за эти часы неполные` : "");
   $("#a-table tbody").innerHTML = rows.map((u) => {
     const status = u.online ? `<span class="tag good"><span class="live"></span>В сети</span>`
@@ -614,7 +620,7 @@ function renderAudit() {
     return `<tr class="click ${S.auditSel.has(u.login) ? "selected" : ""}" data-user="${esc(u.login)}">
       <td class="chk"><input type="checkbox" data-sel="${esc(u.login)}" ${S.auditSel.has(u.login) ? "checked" : ""} aria-label="Выбрать ${esc(u.login)}"></td>
       <td>${status}</td>
-      <td class="login">${esc(u.login)}${u.source === "imported" ? ` <span class="tag muted">импорт</span>` : ""}${personLine(u.login)}</td>
+      <td class="login">${esc(u.login)}${u.source === "imported" ? ` <span class="tag muted">импорт</span>` : ""}${u.deleted ? ` <span class="tag bad" title="Учётки больше нет в конфигурации роутеров; история её сессий сохранена">удалена с роутера</span>` : ""}${personLine(u.login)}</td>
       <td class="num">${u.connects_period}</td>
       <td class="num">${u.active_days}</td>
       <td class="num">${esc(u.work_time)}</td>

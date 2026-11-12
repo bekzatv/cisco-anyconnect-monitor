@@ -275,6 +275,30 @@ class DirectoryTest(Base):
         self.assertEqual(self.c.check_expiry({}, now=datetime(2026, 11, 13, 7, 0).timestamp()), "")  # before 9:00
         self.assertEqual(len(self.sent), 1)
 
+    def test_audit_marks_accounts_deleted_on_the_router(self):
+        from vpnmon.cleanup import mark_deleted_accounts
+
+        now = int(time.time())
+        for login in ("ivanov", "olduser", "online"):
+            self.store.record_snapshot([VpnSession("C", login, "1.2.3.4", 1, "00:10:00", "00:00:01")],
+                                       now_ts=now - DAY, router="main")
+        self.store.record_snapshot([VpnSession("C", "online", "1.2.3.4", 1, "00:10:00", "00:00:01")],
+                                   now_ts=now - DAY + 60, router="main")
+        rows = self.store.get_all_users_summary(days=30, now_ts=now)
+        # Accounts not loaded from the router yet: nothing can be called deleted.
+        self.assertFalse(mark_deleted_accounts(self.store, [router()], rows))
+        self.assertFalse(any(r["deleted"] for r in rows))
+
+        self.store.sync_router_users("main", [("ivanov", 0), ("olduser", 0)], now_ts=now)
+        self.store.sync_router_users("main", [("ivanov", 0)], now_ts=now)  # olduser deleted on the router
+        rows = self.store.get_all_users_summary(days=30, now_ts=now)
+        self.assertTrue(mark_deleted_accounts(self.store, [router()], rows))
+        deleted = {r["login"]: r["deleted"] for r in rows}
+        # History stays, the row is only flagged; a user online right now is never flagged.
+        self.assertEqual(deleted, {"ivanov": False, "olduser": True, "online": False})
+        # A second router whose accounts were never loaded disables the check.
+        self.assertFalse(mark_deleted_accounts(self.store, [router(), router("branch")], rows))
+
     def test_expired_account_is_a_cleanup_candidate_even_if_used(self):
         now = int(datetime(2026, 11, 12, 10, 0).timestamp())
         self.store.sync_router_users("main", [("contractor", 0), ("ivanov", 0)], now_ts=now - 100 * DAY)

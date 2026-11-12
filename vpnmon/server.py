@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from . import __version__
 from .cisco import CiscoConnection, VpnSession, clean_text, is_outdated
-from .cleanup import build_cleanup
+from .cleanup import build_cleanup, mark_deleted_accounts
 from .collector import Collector, TelegramNotifier, parse_date
 from .routercfg import config_diff, mask_config
 from .config import (
@@ -933,6 +933,7 @@ def make_handler(app: App):
             minimum = setting(settings, "min_client_version")
             for r in rows:
                 r["client_outdated"] = is_outdated(r["client_version"], minimum)
+            mark_deleted_accounts(app.store, get_routers(settings), rows)
             return rows
 
         def audit(self, q):
@@ -948,7 +949,7 @@ def make_handler(app: App):
                       "connects_90d", "active_days", "work_time", "unique_ips", "last_connected",
                       "days_idle_str", "last_ip", "last_country", "last_org", "source",
                       "reconnects", "reconnects_peak_day", "reconnects_peak_date", "unstable",
-                      "client_os", "client_version", "client_outdated", "routers"]
+                      "client_os", "client_version", "client_outdated", "routers", "deleted"]
             writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore", delimiter=";")
             writer.writeheader()
             writer.writerows(rows)
