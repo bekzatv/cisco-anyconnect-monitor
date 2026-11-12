@@ -29,9 +29,11 @@
         <a href="#/overview" data-view="overview"><span class="ico">◧</span>Обзор</a>
         <a href="#/sessions" data-view="sessions"><span class="ico">⇄</span>Сессии<span class="badge" id="nav-sessions">0</span></a>
         <a href="#/audit" data-view="audit"><span class="ico">☷</span>Аудит пользователей</a>
+        <a href="#/people" data-view="people"><span class="ico">☺</span>Сотрудники<span class="badge alert hidden" id="nav-expiry">0</span></a>
         <a href="#/accounts" data-view="accounts"><span class="ico">⌫</span>Учётки на удаление</a>
         <a href="#/events" data-view="events"><span class="ico">≡</span>Журнал<span class="badge alert hidden" id="nav-alerts">0</span></a>
         <a href="#/routerlog" data-view="routerlog"><span class="ico">⌁</span>Журнал роутера</a>
+        <a href="#/configs" data-view="configs"><span class="ico">⎘</span>Конфигурация</a>
         <a href="#/settings" data-view="settings"><span class="ico">⚙</span>Настройки</a>
       </nav>
       <div class="sidebar-foot">
@@ -88,6 +90,13 @@
           <div class="card">
             <div class="card-head"><h2>Сейчас в сети</h2><a href="#/sessions" class="link small">Все сессии →</a></div>
             <ul id="online-list" class="online-list"></ul>
+          </div>
+          <div class="card span-2 hidden" id="capacity-card">
+            <div class="card-head">
+              <h2>Ёмкость VPN</h2>
+              <span class="muted small" id="capacity-sub"></span>
+            </div>
+            <div id="capacity-list" class="client-groups"></div>
           </div>
           <div class="card span-2">
             <div class="card-head">
@@ -171,10 +180,66 @@
         </div>
       </section>
 
+      <!-- Employee directory -->
+      <section class="view hidden" id="view-people">
+        <div class="toolbar wrap">
+          <div class="seg" id="p-filter">
+            <button data-f="all" class="on">Все <i id="p-c-all"></i></button><button data-f="filled">С данными <i id="p-c-filled"></i></button><button data-f="empty" title="Учётки без ФИО и отдела">Без данных <i id="p-c-empty"></i></button><button data-f="expiring" title="Срок доступа скоро закончится или уже закончился">Срок доступа <i id="p-c-expiring"></i></button><button data-f="gone" title="Записи справочника, учёток которых уже нет на роутерах">Нет на роутере <i id="p-c-gone"></i></button>
+          </div>
+          <input id="p-search" class="search sm" type="search" placeholder="Логин, ФИО, отдел, телефон…">
+          <div class="spacer"></div>
+          <button class="btn admin-only" id="p-import" type="button">+ Импорт CSV</button>
+          <a class="btn" id="p-export" href="/api/export/directory.csv">⤓ CSV</a>
+        </div>
+        <div class="card flush">
+          <div class="table-wrap">
+            <table class="table" id="p-table">
+              <thead><tr>
+                <th data-k="login">Учётка</th>
+                <th data-k="full_name">ФИО</th>
+                <th data-k="department">Отдел</th>
+                <th data-k="phone">Телефон</th>
+                <th data-k="comment">Комментарий</th>
+                <th data-k="expires_key">Доступ до</th>
+                <th></th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="empty hidden" id="p-empty">Нет учёток</div>
+        </div>
+        <p class="muted small">Список учёток — все, кто подключался к VPN, импортирован или загружен с роутеров. ФИО и отдел показываются в сессиях, аудите, тревогах и в списке на удаление. За несколько дней до окончания срока доступа и после него в Telegram приходит напоминание, а учётка с истёкшим сроком сразу попадает в «Учётки на удаление».</p>
+      </section>
+
+      <!-- Router configuration history -->
+      <section class="view hidden" id="view-configs">
+        <div class="card intro" id="cfg-status"></div>
+        <div class="toolbar wrap">
+          <div class="seg hidden" id="cfg-router"></div>
+          <span class="muted small" id="cfg-count"></span>
+          <div class="spacer"></div>
+          <button class="btn admin-only" id="cfg-backup" type="button">⇣ Сохранить копию сейчас</button>
+        </div>
+        <div class="grid-2 cfg-grid">
+          <div class="card flush">
+            <div class="table-wrap">
+              <table class="table dense" id="cfg-table">
+                <thead><tr><th>Когда</th><th class="col-router">Устройство</th><th>Почему</th><th class="num">Изменения</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <div class="empty hidden" id="cfg-empty">Копий пока нет</div>
+          </div>
+          <div class="card" id="cfg-view">
+            <p class="muted">Выберите копию слева, чтобы увидеть, что в ней изменилось.</p>
+          </div>
+        </div>
+      </section>
+
       <!-- Accounts cleanup -->
       <section class="view hidden" id="view-accounts">
         <div class="card intro">
-          <p>Локальные учётки с роутеров, которыми не пользовались для VPN дольше заданного срока, и готовые команды для их удаления. <b>Панель ничего не меняет на роутере</b> — команды нужно проверить и выполнить самостоятельно.</p>
+          <p>Локальные учётки с роутеров, которыми не пользовались для VPN дольше заданного срока или у которых закончился срок доступа (из справочника «Сотрудники»), и готовые команды для их удаления. <b>Панель ничего не меняет на роутере</b> — команды нужно проверить и выполнить самостоятельно.</p>
           <div class="toolbar wrap">
             <label class="inline">Без входа не меньше, дней <input id="c-days" type="number" min="7" class="narrow-input"></label>
             <button class="btn" id="c-apply" type="button">Показать</button>
@@ -307,6 +372,19 @@
             <label class="switch"><input type="checkbox" name="syslog_alert_interfaces"><span></span>Тревога: падение физического интерфейса</label>
             <label>Тревога: неудачных входов за 10 минут, не меньше<input name="syslog_auth_fail_threshold" type="number" min="1" class="narrow-input"></label>
             <p class="muted small">Включение и порт применяются после перезапуска сервера.</p>
+          </div>
+          <div class="card">
+            <h2>Конфигурация и ёмкость</h2>
+            <label class="switch"><input type="checkbox" name="config_backup_enabled"><span></span>Сохранять копии конфигурации роутеров (раз в сутки и после каждого изменения)</label>
+            <label class="switch"><input type="checkbox" name="config_diff_telegram"><span></span>Telegram: что именно изменилось в конфигурации</label>
+            <label>Хранить копий на устройство<input name="config_keep_versions" type="number" min="10" max="5000" class="narrow-input"></label>
+            <label>Тревога: пул адресов или лицензии AnyConnect заполнены на, %<input name="pool_alert_percent" type="number" min="0" max="100" class="narrow-input" title="0 — не предупреждать"></label>
+            <p class="muted small">Изменения ловятся по сообщению роутера «Configured from …» в его журнале (syslog), поэтому для копий сразу после изменения нужен настроенный приём журнала. Пароли и ключи в панели скрыты; полную копию может скачать только администратор.</p>
+            <h3>Сроки доступа</h3>
+            <div class="form-grid">
+              <label>Предупреждать за, дней<input name="expiry_warn_days" type="number" min="0" max="60"></label>
+              <label>Напоминание в, ч<input name="expiry_notify_hour" type="number" min="0" max="23"></label>
+            </div>
           </div>
           <div class="save-bar"><span class="muted small" id="settings-msg"></span><button class="btn primary" type="submit">Сохранить</button></div>
         </form>

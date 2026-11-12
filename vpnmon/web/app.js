@@ -147,6 +147,22 @@ function bindSeg(id, onChange) {
   });
 }
 
+// Name and department from the employee directory, shown under a login.
+function personOf(login) {
+  return S.state?.people?.[String(login || "").toLowerCase()] || null;
+}
+function personText(login) {
+  const p = personOf(login);
+  return p ? [p.name, p.dept].filter(Boolean).join(", ") : "";
+}
+function personLine(login) {
+  const t = personText(login);
+  return t ? `<small class="person">${esc(t)}</small>` : "";
+}
+const todayIso = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
+const daysUntil = (iso) => iso ? Math.round((new Date(`${iso}T00:00:00`) - new Date(`${todayIso()}T00:00:00`)) / 86400000) : null;
+const fmtIsoDate = (iso) => iso ? iso.split("-").reverse().join(".") : "";
+
 function clientLabel(o) {
   if (!o.client_version && !o.client_agent) return `<span class="muted">—</span>`;
   const text = [o.client_os, o.client_version].filter(Boolean).join(" ") || o.client_agent;
@@ -217,9 +233,11 @@ const VIEWS = {
   overview: { title: "Обзор", load: loadOverview },
   sessions: { title: "Активные сессии", load: renderSessions },
   audit: { title: "Аудит пользователей", load: loadAudit },
+  people: { title: "Сотрудники", load: loadPeople },
   accounts: { title: "Учётки на удаление", load: loadCleanup },
   events: { title: "Журнал событий", load: loadEvents },
   routerlog: { title: "Журнал роутера", load: loadSyslog },
+  configs: { title: "Конфигурация роутеров", load: loadConfigs },
   settings: { title: "Настройки", load: loadSettings },
 };
 
@@ -314,6 +332,9 @@ async function pollState() {
   else statusText = "Запуск…";
   setCollector(st.status, statusText);
   $("#nav-sessions").textContent = st.kpi.sessions;
+  const expiring = Object.values(st.people || {}).filter((p) => p.expires && daysUntil(p.expires) <= (st.expiry_warn_days ?? 3)).length;
+  $("#nav-expiry").textContent = expiring;
+  $("#nav-expiry").classList.toggle("hidden", !expiring);
   $("#last-poll").textContent = st.last_success_ts ? `Данные: ${fmtTs(st.last_success_ts, false)}` : "";
 
   const banner = $("#banner");
@@ -379,12 +400,40 @@ function renderOverviewLive() {
   $("#k-users-sub").textContent = multiCount ? `${multiCount} с нескольких IP` : "каждый с одного IP";
   const list = sortRows(st.sessions, "created_s", true);
   $("#online-list").innerHTML = list.length
-    ? list.map((s) => `<li><span><span class="live"></span><b>${esc(s.login)}</b></span><span class="muted">${esc(s.country && s.country !== "—" ? s.country.split(" / ")[0] : s.ip)} · ${s.created_s != null ? fmtDur(s.created_s) : esc(s.created)}</span></li>`).join("")
+    ? list.map((s) => `<li><span><span class="live"></span><b>${esc(s.login)}</b>${personText(s.login) ? ` <span class="muted">${esc(personText(s.login))}</span>` : ""}</span><span class="muted">${esc(s.country && s.country !== "—" ? s.country.split(" / ")[0] : s.ip)} · ${s.created_s != null ? fmtDur(s.created_s) : esc(s.created)}</span></li>`).join("")
     : `<li class="muted">Никого нет в сети</li>`;
   $("#routers-card").classList.toggle("hidden", !multiRouter());
   $("#router-chips").innerHTML = st.routers.map((r) => `<div class="router-chip ${esc(r.status)}">
       <span class="dot"></span><div><b>${esc(r.name)}</b><small>${esc(r.host)} · ${esc(STATUS_TEXT[r.status] || r.status)}</small></div>
       <span class="count">${r.sessions}</span></div>`).join("");
+  renderCapacity(st);
+}
+
+function renderCapacity(st) {
+  const rows = [];
+  for (const r of st.routers) {
+    const cap = r.capacity || {};
+    const where = multiRouter() ? `${r.name}: ` : "";
+    for (const p of cap.pools || []) {
+      const used = p.in_use + p.blocked;
+      rows.push({ label: `${where}пул ${p.name}`, used, total: p.total, percent: p.percent, title: `Диапазоны: ${p.ranges.join(", ")}. Свободно ${p.free}.` });
+    }
+    if (cap.license) {
+      const l = cap.license;
+      rows.push({ label: `${where}лицензии AnyConnect`, used: l.used, total: l.limit, percent: l.percent,
+        title: l.source === "settings" ? "Число лицензий указано в настройках устройства" : `По данным show license${l.state ? `: ${l.state}` : ""}` });
+    }
+  }
+  $("#capacity-card").classList.toggle("hidden", !rows.length);
+  if (!rows.length) return;
+  const threshold = st.pool_alert_percent || 80;
+  const worst = Math.max(...rows.map((x) => x.percent));
+  $("#capacity-sub").textContent = `самое заполненное — ${worst}%${threshold ? ` · тревога от ${threshold}%` : ""}`;
+  $("#capacity-list").innerHTML = rows.map((x) => `<div class="client-row ${x.percent >= threshold ? "old" : ""}" title="${esc(x.title)}">
+      <span class="client-name">${esc(x.label)}${x.percent >= threshold ? ` <span class="tag warn">${x.percent}%</span>` : ""}</span>
+      <span class="client-bar"><i style-width="${Math.min(100, x.percent)}"></i></span>
+      <span class="client-count">${x.used}/${x.total}</span></div>`).join("");
+  $$("#capacity-list [style-width]").forEach((i) => { i.style.width = `${i.getAttribute("style-width")}%`; });
 }
 
 async function loadConcurrency() {
@@ -470,7 +519,7 @@ function renderSessions() {
   const ipsByLogin = {};
   st.sessions.forEach((s) => (ipsByLogin[s.login.toLowerCase()] ??= new Set()).add(s.ip));
   let rows = st.sessions.filter((s) => (!routerFilter || s.router === routerFilter) &&
-    (!q || [s.login, s.ip, s.country, s.org, s.context, s.client_agent, s.router_name].join(" ").toLowerCase().includes(q)));
+    (!q || [s.login, personText(s.login), s.ip, s.country, s.org, s.context, s.client_agent, s.router_name].join(" ").toLowerCase().includes(q)));
   rows = sortRows(rows, S.sessSort.key, S.sessSort.desc);
   markSorted($("#s-table"), S.sessSort);
   $("#s-count").textContent = rows.length !== st.sessions.length ? `${rows.length} из ${st.sessions.length}` : `${st.sessions.length} сессий`;
@@ -479,7 +528,7 @@ function renderSessions() {
     const multiIp = ipsByLogin[s.login.toLowerCase()].size > 1;
     const idle = s.last_used_s ?? 0;
     return `<tr class="${multiIp ? "warnrow" : ""}" data-i="${st.sessions.indexOf(s)}">
-      <td><span class="live"></span><a href="#" class="login link" data-user="${esc(s.login)}">${esc(s.login)}</a>${multiIp ? ` <span class="tag warn" title="Одновременно с нескольких IP">${ipsByLogin[s.login.toLowerCase()].size} IP</span>` : ""}</td>
+      <td><span class="live"></span><a href="#" class="login link" data-user="${esc(s.login)}">${esc(s.login)}</a>${multiIp ? ` <span class="tag warn" title="Одновременно с нескольких IP">${ipsByLogin[s.login.toLowerCase()].size} IP</span>` : ""}${personLine(s.login)}</td>
       <td class="col-router ${multi ? "" : "hidden"}">${esc(s.router_name)}</td>
       <td class="mono" title="${s.tunnel_ip ? `IP в туннеле: ${esc(s.tunnel_ip)}` : ""}">${esc(s.ip)}</td>
       <td>${esc(s.country)}</td>
@@ -552,7 +601,7 @@ function renderAudit() {
     unstable: (u) => u.unstable,
     outdated: (u) => u.client_outdated,
   }[f] || (() => true);
-  let rows = S.audit.filter((u) => match(u) && (!q || u.login.toLowerCase().includes(q)));
+  let rows = S.audit.filter((u) => match(u) && (!q || `${u.login} ${personText(u.login)}`.toLowerCase().includes(q)));
   rows = sortRows(rows, S.auditSort.key, S.auditSort.desc);
   markSorted($("#a-table"), S.auditSort);
   const days = segValue("a-period", "days");
@@ -565,7 +614,7 @@ function renderAudit() {
     return `<tr class="click ${S.auditSel.has(u.login) ? "selected" : ""}" data-user="${esc(u.login)}">
       <td class="chk"><input type="checkbox" data-sel="${esc(u.login)}" ${S.auditSel.has(u.login) ? "checked" : ""} aria-label="Выбрать ${esc(u.login)}"></td>
       <td>${status}</td>
-      <td class="login">${esc(u.login)}${u.source === "imported" ? ` <span class="tag muted">импорт</span>` : ""}</td>
+      <td class="login">${esc(u.login)}${u.source === "imported" ? ` <span class="tag muted">импорт</span>` : ""}${personLine(u.login)}</td>
       <td class="num">${u.connects_period}</td>
       <td class="num">${u.active_days}</td>
       <td class="num">${esc(u.work_time)}</td>
@@ -614,6 +663,7 @@ async function openUser(login) {
     const lastClient = h.find((r) => r.client_agent);
     const sub = [online ? "Сейчас в сети" : h.length ? `Последний вход: ${h[0].first_seen_iso}` : "Входов за 90 дней нет"];
     if (lastClient) sub.push(`клиент: ${lastClient.client_agent}`);
+    if (personText(login)) sub.unshift(personText(login));
     $("#d-sub").textContent = sub.join(" · ");
     $("#d-kpis").innerHTML = [
       ["Сессий", h.length], ["Время в сети", fmtDur(total)], ["Разных IP", ips.size], ["Переподключений", reconnects],
@@ -664,15 +714,15 @@ function renderCleanup(d) {
     else if (!r.observed_since) note = "Сессий с этого устройства пока нет — не с чем сравнивать.";
     else note = `Учёток в конфиге: ${r.users_total}, загружено ${fmtTs(r.synced_ts)}. Наблюдение за входами ведётся с ${fmtDate(r.observed_since)} (${r.observed_days} дн.)`
       + (r.observed_days < d.idle_days ? ` — <b>учётки без единого входа появятся в списке не раньше ${esc(r.ready_from)}</b>: раньше нельзя отличить неиспользуемую учётку от сотрудника в отпуске.` : ".");
-    const rows = r.candidates.map((c) => `<tr><td class="login">${esc(c.login)}</td>
-      <td>${c.never ? `<span class="muted">не входил с начала наблюдения</span>` : esc(c.last_activity)}</td>
+    const rows = r.candidates.map((c) => `<tr><td class="login">${esc(c.login)}${c.person ? `<small class="person">${esc(c.person)}</small>` : ""}</td>
+      <td>${c.expired ? `<span class="tag bad">доступ до ${esc(c.expired)}</span>${c.online ? ` <span class="tag good">в сети</span>` : ""}` : c.never ? `<span class="muted">не входил с начала наблюдения</span>` : esc(c.last_activity)}</td>
       <td class="num">${c.idle_days}</td></tr>`).join("");
     return `<div class="card cleanup-card">
       <div class="card-head"><h2>${esc(r.name)} <span class="muted small">${esc(r.host)}</span></h2>
         <span class="tag ${r.candidates.length ? "warn" : "good"}">${r.candidates.length ? `${r.candidates.length} к удалению` : "нечего удалять"}</span></div>
       <p class="muted small">${note}</p>
       ${r.candidates.length ? `<div class="grid-2 cleanup-grid">
-        <div class="table-wrap static"><table class="table dense"><thead><tr><th>Учётка</th><th>Последний вход</th><th class="num">Дней без входа</th></tr></thead><tbody>${rows}</tbody></table></div>
+        <div class="table-wrap static"><table class="table dense"><thead><tr><th>Учётка</th><th>Последний вход / причина</th><th class="num">Дней без входа</th></tr></thead><tbody>${rows}</tbody></table></div>
         <div><div class="card-head"><h3>Команды для роутера</h3><button class="btn sm" type="button" data-copy="${i}">Копировать</button></div>
         <pre class="commands" id="c-cmd-${i}">${esc(r.commands)}</pre>
         <p class="muted small">Выполните в SSH-сессии на устройстве. Пустая строка после команды отвечает на вопрос IOS <code>[confirm]</code>. Сначала проверьте, что учётки не используются для чего-то кроме VPN.</p></div>
@@ -681,6 +731,182 @@ function renderCleanup(d) {
     </div>`;
   }).join("") || `<div class="card"><p class="muted">Нет настроенных устройств.</p></div>`;
   $$("[data-copy]").forEach((b) => b.onclick = () => copyText(d.routers[+b.dataset.copy].commands, "Команды скопированы"));
+}
+
+// ---------------------------------------------------------------- employee directory
+S.people = [];
+S.peopleSort = { key: "login", desc: false };
+async function loadPeople() {
+  try { S.peopleData = await api("GET", "/api/directory"); }
+  catch (err) { toast(err.message, true); return; }
+  S.people = S.peopleData.entries.map((e) => ({ ...e, expires_key: e.expires || "9999" }));
+  renderPeople();
+}
+
+function renderPeople() {
+  const f = segValue("p-filter", "f");
+  const q = $("#p-search").value.trim().toLowerCase();
+  const warn = S.peopleData?.warn_days ?? 3;
+  const expiring = (e) => e.days_left != null && e.days_left <= warn;
+  const filled = (e) => e.full_name || e.department;
+  const counts = { all: S.people.length, filled: 0, empty: 0, expiring: 0, gone: 0 };
+  S.people.forEach((e) => {
+    counts[filled(e) ? "filled" : "empty"]++;
+    if (expiring(e)) counts.expiring++;
+    if (e.on_router === false) counts.gone++;
+  });
+  for (const k in counts) $(`#p-c-${k}`).textContent = counts[k];
+  const match = { filled, empty: (e) => !filled(e), expiring, gone: (e) => e.on_router === false }[f] || (() => true);
+  let rows = S.people.filter((e) => match(e) && (!q || [e.login, e.full_name, e.department, e.phone, e.comment].join(" ").toLowerCase().includes(q)));
+  rows = sortRows(rows, S.peopleSort.key, S.peopleSort.desc);
+  markSorted($("#p-table"), S.peopleSort);
+  $("#view-sub").textContent = `Учёток: ${counts.all} · с ФИО или отделом: ${counts.filled}` + (counts.expiring ? ` · срок доступа заканчивается или закончился: ${counts.expiring}` : "");
+  $("#p-empty").classList.toggle("hidden", rows.length > 0);
+  $("#p-table tbody").innerHTML = rows.map((e) => {
+    let exp = `<span class="muted">—</span>`;
+    if (e.expires) {
+      const d = e.days_left;
+      const cls = d < 0 ? "bad" : d <= warn ? "warn" : "muted";
+      const note = d < 0 ? `истёк ${-d} дн. назад` : d === 0 ? "последний день" : `через ${d} дн.`;
+      exp = `<span class="tag ${cls}" title="${esc(note)}">${esc(fmtIsoDate(e.expires))}</span> <span class="muted small">${esc(note)}</span>`;
+    }
+    return `<tr class="click" data-login="${esc(e.login)}">
+      <td class="login">${esc(e.login)}${e.on_router === false ? ` <span class="tag muted" title="Учётки нет в конфигурации роутеров (по последнему обновлению списка)">нет на роутере</span>` : ""}</td>
+      <td>${esc(e.full_name) || `<span class="muted">—</span>`}</td>
+      <td>${esc(e.department)}</td>
+      <td class="mono">${esc(e.phone)}</td>
+      <td class="ellipsis" title="${esc(e.comment)}">${esc(e.comment)}</td>
+      <td>${exp}</td>
+      <td class="actions">${isAdmin() ? `<button class="btn sm" type="button" data-pedit="${esc(e.login)}">Изменить</button>` : ""}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function editPerson(e) {
+  const result = (text) => { const el = $("#pf-result"); el.textContent = text; el.className = "small error-text"; };
+  const isNew = !e.login;
+  const dialog = modal({
+    title: isNew ? "Новая запись" : `Учётка ${e.login}`,
+    html: `<div class="form-grid">
+      <label>Логин (как на роутере)<input id="pf-login" value="${esc(e.login || "")}" ${isNew ? "" : "readonly"} autocomplete="off"></label>
+      <label>ФИО<input id="pf-name" value="${esc(e.full_name || "")}" placeholder="Иванов Иван"></label>
+      <label>Отдел<input id="pf-dept" value="${esc(e.department || "")}" placeholder="Бухгалтерия"></label>
+      <label>Телефон<input id="pf-phone" value="${esc(e.phone || "")}"></label>
+      <label>Доступ до (включительно)<input id="pf-expires" type="date" value="${esc(e.expires || "")}"></label>
+      <label>Комментарий<input id="pf-comment" value="${esc(e.comment || "")}" placeholder="подрядчик, договор №…"></label>
+    </div>
+    <p class="muted small">Срок доступа — для подрядчиков и временных сотрудников: заранее придёт напоминание, а после срока учётка появится в «Учётках на удаление». Сам доступ на роутере панель не закрывает.</p>
+    <p class="small" id="pf-result"></p>`,
+    wide: true,
+    actions: [
+      ...(e.has_entry ? [{ label: "Очистить данные", cls: "danger", onClick: async () => {
+        try { await api("POST", "/api/directory/delete", { login: e.login }); return true; }
+        catch (err) { result(err.message); return false; }
+      } }] : []),
+      { label: "Сохранить", cls: "primary", onClick: async () => {
+        try {
+          await api("POST", "/api/directory/save", {
+            login: $("#pf-login").value.trim(), full_name: $("#pf-name").value, department: $("#pf-dept").value,
+            phone: $("#pf-phone").value, comment: $("#pf-comment").value, expires: $("#pf-expires").value,
+          });
+          return true;
+        } catch (err) { result(err.message); return false; }
+      } },
+    ],
+  });
+  if (await dialog) { toast("Сохранено"); await pollState(); loadPeople(); }
+}
+
+async function importPeople() {
+  const ok = await modal({
+    title: "Импорт справочника",
+    wide: true,
+    html: `<p class="muted small">Вставьте строки из Excel или CSV (разделитель — точка с запятой, запятая или табуляция). Столбцы по порядку: <b>логин; ФИО; отдел; телефон; комментарий; доступ до</b>. Можно с заголовком — тогда порядок любой (Логин, ФИО, Отдел, Телефон, Комментарий, Доступ до). Существующие записи с теми же логинами заменяются.</p>
+      <textarea id="pi-text" placeholder="ivanov;Иванов Иван;Бухгалтерия;+7 701 000 00 00;;&#10;contractor1;ТОО Подрядчик;Внешние;;договор 15;31.12.2026"></textarea>
+      <label class="small">или выберите файл <input type="file" id="pi-file" accept=".csv,.txt"></label>`,
+    actions: [{ label: "Импортировать", cls: "primary", value: "go" }],
+  });
+  if (ok !== "go") return;
+  let text = $("#pi-text")?.value || "";
+  const file = $("#pi-file")?.files?.[0];
+  if (file) {
+    const buf = await file.arrayBuffer();
+    text = new TextDecoder("utf-8").decode(buf);
+    // Excel on Russian Windows saves CSV in cp1251: decoding as UTF-8 then gives replacement characters.
+    if (text.includes("\uFFFD")) text = new TextDecoder("windows-1251").decode(buf);
+  }
+  try { const r = await api("POST", "/api/directory/import", { text }); toast(`Импортировано записей: ${r.imported}`); await pollState(); loadPeople(); }
+  catch (err) { modal({ title: "Импорт не выполнен", html: `<p class="error-text">${esc(err.message)}</p>` }); }
+}
+
+// ---------------------------------------------------------------- router configuration
+const REASON_TAG = { "изменение конфигурации": "warn", "первая копия": "muted", "ежедневная проверка": "muted" };
+async function loadConfigs() {
+  const seg = $("#cfg-router");
+  let d;
+  try { d = await api("GET", "/api/configs"); }
+  catch (err) { toast(err.message, true); return; }
+  S.configs = d;
+  const multi = d.routers.length > 1;
+  seg.classList.toggle("hidden", !multi);
+  if (multi && seg.dataset.ids !== d.routers.map((r) => r.id).join(",")) {
+    seg.dataset.ids = d.routers.map((r) => r.id).join(",");
+    seg.innerHTML = `<button data-r="" class="on">Все</button>` + d.routers.map((r) => `<button data-r="${esc(r.id)}">${esc(r.name)}</button>`).join("");
+  }
+  const status = d.routers.map((r) => {
+    if (r.error) return `<p class="error-text"><b>${esc(r.name)}:</b> ${esc(r.error)}</p>`;
+    return `<p class="small"><span class="status-dot ${r.checked_ts ? "ok" : ""}"></span><b>${esc(r.name)}</b>: ${r.checked_ts ? `проверена ${esc(ago(r.checked_ts))}, копий ${r.count}` : "копия ещё не снималась — первая появится в течение минуты после запуска"}</p>`;
+  }).join("");
+  $("#cfg-status").innerHTML = (d.enabled ? "" : `<p class="warn-text"><b>Копирование конфигурации выключено</b> в настройках.</p>`)
+    + (status || `<p class="muted">Нет устройств.</p>`)
+    + `<p class="muted small">Копия снимается командой <code>show running-config</code> раз в сутки и примерно через минуту после сообщения роутера об изменении конфигурации. Новая версия сохраняется, только если что-то поменялось. Пароли и ключи на экране скрыты.</p>`;
+  renderConfigs();
+}
+
+function renderConfigs() {
+  const d = S.configs;
+  if (!d) return;
+  const multi = d.routers.length > 1;
+  const rid = multi ? segValue("cfg-router", "r") || "" : "";
+  const rows = d.versions.filter((v) => !rid || v.router === rid);
+  $("#cfg-count").textContent = `Версий: ${rows.length}`;
+  $("#cfg-empty").classList.toggle("hidden", rows.length > 0);
+  $$("#cfg-table .col-router").forEach((c) => c.classList.toggle("hidden", !multi));
+  $("#cfg-table tbody").innerHTML = rows.map((v) => `<tr class="click ${S.configSel === v.id ? "selected" : ""}" data-cfg="${v.id}">
+      <td>${esc(fmtTs(v.ts))}<small class="person">${esc(fmtDate(v.ts))}</small></td>
+      <td class="col-router ${multi ? "" : "hidden"}">${esc(v.router_name)}</td>
+      <td><span class="tag ${REASON_TAG[v.reason] || "muted"}">${esc(v.reason || "—")}</span>${v.changed_by ? `<small class="person">${esc(v.changed_by)}</small>` : ""}</td>
+      <td class="num">${v.added || v.removed ? `<span class="ok-text">+${v.added}</span> <span class="error-text inline">−${v.removed}</span>` : `<span class="muted">${v.lines} строк</span>`}</td>
+    </tr>`).join("");
+}
+
+async function showConfig(id, mode = "diff") {
+  S.configSel = id;
+  renderConfigs();
+  const box = $("#cfg-view");
+  box.innerHTML = `<p class="muted">Загрузка…</p>`;
+  try {
+    const d = await api("GET", `/api/configs/view?id=${id}&mode=${mode}`);
+    const m = d.meta;
+    const head = `<div class="card-head"><h2>${esc(fmtTs(m.ts))} ${esc(fmtDate(m.ts))}${multiRouter() ? ` <span class="muted small">${esc(S.routerNames[m.router] || m.router)}</span>` : ""}</h2>
+      <div class="row-actions">
+        <button class="btn sm" type="button" data-cfgmode="${mode === "diff" ? "full" : "diff"}">${mode === "diff" ? "Вся конфигурация" : "Только изменения"}</button>
+        ${isAdmin() ? `<a class="btn sm" href="/api/configs/download?id=${m.id}" title="Полная копия с паролями — для восстановления роутера">⤓ Скачать</a>` : ""}
+      </div></div>`;
+    let body;
+    if (mode === "full") {
+      body = `<pre class="commands config-text">${esc(d.text)}</pre>`;
+    } else if (!d.against) {
+      body = `<p class="muted">Это первая сохранённая копия — сравнивать не с чем. Нажмите «Вся конфигурация», чтобы посмотреть её.</p>`;
+    } else {
+      body = `<p class="muted small">По сравнению с копией от ${esc(fmtTs(d.against.ts))} ${esc(fmtDate(d.against.ts))}: добавлено строк ${m.added}, удалено ${m.removed}${m.changed_by ? `, изменил ${esc(m.changed_by)}` : ""}.</p>`
+        + `<pre class="commands diff">${d.diff.map((l) => `<span class="${l.startsWith("+") ? "add" : l.startsWith("-") ? "del" : l.startsWith("@@") ? "hunk" : ""}">${esc(l.startsWith("@@") ? "⋯" : l) || " "}</span>`).join("")}</pre>`;
+    }
+    box.innerHTML = head + body;
+    $("[data-cfgmode]", box).onclick = (e) => showConfig(id, e.currentTarget.dataset.cfgmode);
+  } catch (err) {
+    box.innerHTML = `<p class="error-text">${esc(err.message)}</p>`;
+  }
 }
 
 // ---------------------------------------------------------------- events
@@ -816,6 +1042,7 @@ function routerForm(r) {
     <label>SSH-порт<input id="rf-port" type="number" min="1" max="65535" value="${esc(r.port || 22)}"></label>
     <label>SSH-логин<input id="rf-username" value="${esc(r.username || "")}" autocomplete="off"></label>
     <label>Пароль<input id="rf-password" type="password" autocomplete="new-password" placeholder="${r.password_set ? "сохранён — не менять" : ""}"></label>
+    <label title="0 — взять из show license (SSL_VPN)">Лицензий AnyConnect<input id="rf-license" type="number" min="0" value="${esc(r.license_limit || 0)}"></label>
     <label class="switch inline-switch"><input type="checkbox" id="rf-enabled" ${r.enabled !== false ? "checked" : ""}><span></span>Опрашивать</label>
   </div>
   <label>Команда отключения сессии<input id="rf-disconnect" class="mono" value="${esc(r.disconnect_command || "")}" placeholder="webvpn session disconnect context {context} name {login}"></label>
@@ -828,6 +1055,7 @@ function routerPayload(id) {
     id, name: $("#rf-name").value, host: $("#rf-host").value, port: Number($("#rf-port").value || 22),
     username: $("#rf-username").value, password: $("#rf-password").value,
     enabled: $("#rf-enabled").checked, disconnect_command: $("#rf-disconnect").value,
+    license_limit: Number($("#rf-license").value || 0),
   };
 }
 
@@ -1060,6 +1288,38 @@ function wire() {
       toast("Исключения сохранены");
       loadCleanup($("#c-days").value);
     } catch (err) { toast(err.message, true); }
+  };
+
+  // employee directory
+  bindSeg("p-filter", renderPeople);
+  $("#p-search").oninput = renderPeople;
+  bindSort($("#p-table"), S.peopleSort, renderPeople);
+  $("#p-import").onclick = importPeople;
+  $("#p-table tbody").onclick = (e) => {
+    const tr = e.target.closest("tr[data-login]");
+    if (!tr) return;
+    const entry = S.people.find((x) => x.login === tr.dataset.login);
+    if (e.target.closest("[data-pedit]") || isAdmin()) { if (isAdmin()) editPerson(entry); return; }
+    openUser(entry.login);
+  };
+
+  // router configuration
+  bindSeg("cfg-router", renderConfigs);
+  $("#cfg-table tbody").onclick = (e) => {
+    const tr = e.target.closest("tr[data-cfg]");
+    if (tr) showConfig(+tr.dataset.cfg);
+  };
+  $("#cfg-backup").onclick = async (e) => {
+    const b = e.currentTarget;
+    b.disabled = true;
+    toast("Чтение конфигурации с роутера…");
+    try {
+      const r = await api("POST", "/api/configs/backup", {});
+      toast(r.routers.map((x) => `${x.name}: ${x.error ? x.error : x.changed ? `сохранена новая версия${x.added || x.removed ? ` (+${x.added} −${x.removed})` : ""}` : "изменений нет"}`).join("; "),
+        r.routers.some((x) => x.error));
+      loadConfigs();
+    } catch (err) { toast(err.message, true); }
+    finally { b.disabled = false; }
   };
 
   // drawer

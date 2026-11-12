@@ -16,7 +16,7 @@ from .config import STATS_DB_FILE
 
 log = logging.getLogger("vpnmon.storage")
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEFAULT_ROUTER_ID = "main"
 
 # A session counts as a reconnect when it starts at most RECONNECT_MAX_GAP seconds after the
@@ -246,6 +246,41 @@ class ConnectionStatsStore:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_syslog_ts ON syslog_messages (ts)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_syslog_code ON syslog_messages (code, ts)")
                 conn.execute("PRAGMA user_version = 5")
+                conn.commit()
+        if version < 6:
+            # v6: router configuration history and the employee directory.
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS router_configs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        router TEXT NOT NULL,
+                        ts INTEGER NOT NULL,
+                        sha TEXT NOT NULL,
+                        text TEXT NOT NULL,
+                        reason TEXT DEFAULT '',
+                        changed_by TEXT DEFAULT '',
+                        lines INTEGER DEFAULT 0,
+                        added INTEGER DEFAULT 0,
+                        removed INTEGER DEFAULT 0
+                    )
+                    """
+                )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_router_configs ON router_configs (router, ts)")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS directory (
+                        login TEXT PRIMARY KEY COLLATE NOCASE,
+                        full_name TEXT DEFAULT '',
+                        department TEXT DEFAULT '',
+                        phone TEXT DEFAULT '',
+                        comment TEXT DEFAULT '',
+                        expires TEXT DEFAULT '',
+                        updated_ts INTEGER DEFAULT 0
+                    )
+                    """
+                )
+                conn.execute("PRAGMA user_version = 6")
                 conn.commit()
 
     # -------------------------------------------------------------------------
@@ -932,6 +967,138 @@ class ConnectionStatsStore:
             except Exception:
                 log.exception("get_router_user_activity")
                 return [], None
+
+    def known_logins(self) -> list[str]:
+        with self._lock:
+            try:
+                with self._connect() as conn:
+                    return [r["login"] for r in conn.execute("SELECT login FROM known_users")]
+            except Exception:
+                log.exception("known_logins")
+                return []
+
+    def router_logins(self) -> set[str]:
+        """Logins present on at least one router (lower case), per the last account sync."""
+        with self._lock:
+            try:
+                with self._connect() as conn:
+                    return {r["login"].lower() for r in conn.execute("SELECT login FROM router_users")}
+            except Exception:
+                log.exception("router_logins")
+                return set()
+
+    # -------------------------------------------------------------------------
+    # Router configuration history
+    # -------------------------------------------------------------------------
+    def latest_router_config(self, router: str) -> dict | None:
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM router_configs WHERE router = ? ORDER BY ts DESC, id DESC LIMIT 1", (router,)
+                ).fetchone()
+                return dict(row) if row else None
+
+    def add_router_config(self, router: str, text: str, sha: str, reason: str = "", changed_by: str = "",
+                          now_ts: int | None = None, keep: int = 200) -> dict | None:
+        """Store a configuration if it differs from the last one; returns the new version or None."""
+        from .routercfg import diff_counts
+
+        now_ts = now_ts if now_ts is not None else int(time.time())
+        prev = self.latest_router_config(router)
+        if prev and prev["sha"] == sha:
+            return None
+        added, removed = diff_counts(prev["text"], text) if prev else (0, 0)
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "INSERT INTO router_configs (router, ts, sha, text, reason, changed_by, lines, added, removed) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (router, now_ts, sha, text, reason, changed_by, text.count("\n"), added, removed),
+                )
+                new_id = cur.lastrowid
+                if keep > 0:
+                    conn.execute(
+                        "DELETE FROM router_configs WHERE router = ? AND id NOT IN "
+                        "(SELECT id FROM router_configs WHERE router = ? ORDER BY ts DESC, id DESC LIMIT ?)",
+                        (router, router, keep),
+                    )
+                conn.commit()
+        return {"id": new_id, "router": router, "ts": now_ts, "added": added, "removed": removed,
+                "first": prev is None, "prev_id": prev["id"] if prev else None}
+
+    def list_router_configs(self, router: str = "") -> list[dict]:
+        with self._lock:
+            with self._connect() as conn:
+                sql = ("SELECT id, router, ts, sha, reason, changed_by, lines, added, removed, length(text) AS size "
+                       "FROM router_configs")
+                args: tuple = ()
+                if router:
+                    sql += " WHERE router = ?"
+                    args = (router,)
+                return [dict(r) for r in conn.execute(sql + " ORDER BY ts DESC, id DESC", args)]
+
+    def get_router_config(self, config_id: int) -> dict | None:
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute("SELECT * FROM router_configs WHERE id = ?", (config_id,)).fetchone()
+                return dict(row) if row else None
+
+    def previous_router_config(self, config_id: int) -> dict | None:
+        cur = self.get_router_config(config_id)
+        if not cur:
+            return None
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM router_configs WHERE router = ? AND (ts < ? OR (ts = ? AND id < ?)) "
+                    "ORDER BY ts DESC, id DESC LIMIT 1",
+                    (cur["router"], cur["ts"], cur["ts"], cur["id"]),
+                ).fetchone()
+                return dict(row) if row else None
+
+    # -------------------------------------------------------------------------
+    # Employee directory
+    # -------------------------------------------------------------------------
+    DIRECTORY_FIELDS = ("full_name", "department", "phone", "comment", "expires")
+
+    def get_directory(self) -> dict[str, dict]:
+        """login (lower case) -> entry."""
+        with self._lock:
+            try:
+                with self._connect() as conn:
+                    return {r["login"].lower(): dict(r) for r in conn.execute("SELECT * FROM directory")}
+            except Exception:
+                log.exception("get_directory")
+                return {}
+
+    def save_directory_entries(self, entries: list[dict], now_ts: int | None = None) -> int:
+        """Insert or replace entries; an entry with every field empty is removed."""
+        now_ts = now_ts if now_ts is not None else int(time.time())
+        n = 0
+        with self._lock:
+            with self._connect() as conn:
+                for e in entries:
+                    login = str(e.get("login", "")).strip()
+                    if not login:
+                        continue
+                    values = [str(e.get(k) or "").strip() for k in self.DIRECTORY_FIELDS]
+                    conn.execute("DELETE FROM directory WHERE login = ? COLLATE NOCASE", (login,))
+                    if any(values):
+                        conn.execute(
+                            "INSERT INTO directory (login, full_name, department, phone, comment, expires, updated_ts) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (login, *values, now_ts),
+                        )
+                    n += 1
+                conn.commit()
+        return n
+
+    def delete_directory_entry(self, login: str) -> int:
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute("DELETE FROM directory WHERE login = ? COLLATE NOCASE", (login.strip(),))
+                conn.commit()
+                return cur.rowcount or 0
 
     # -------------------------------------------------------------------------
     # Small key/value state (report schedule, sync times)

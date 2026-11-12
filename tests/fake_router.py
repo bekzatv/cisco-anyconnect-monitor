@@ -2,7 +2,8 @@
 
 python tests/fake_router.py --port 2222   (login: admin / admin)
 Serves `show webvpn session context all` with Created/Last_Used ages that grow over time,
-and supports `webvpn session disconnect context <ctx> name <login>`.
+and supports `webvpn session disconnect context <ctx> name <login>`, `show running-config`,
+`show ip local pool`, `show license`, and `username ...` / `no username ...` to change the config.
 """
 
 from __future__ import annotations
@@ -107,10 +108,56 @@ def session_detail(login: str) -> str:
     return "\r\n".join(blocks) if blocks else "% No session found"
 
 
+POOL_SIZE = {"main": 50, "branch": 8}
+
+
+def running_config() -> str:
+    users = "\r\n".join(f"username {u} privilege {p} secret 9 $9$fakehash{u}" for u, p in USERS[PROFILE])
+    return (
+        "Building configuration...\r\n\r\n"
+        "Current configuration : 4096 bytes\r\n!\r\n"
+        f"! Last configuration change at {time.strftime('%H:%M:%S')} ALM\r\n!\r\n"
+        "version 15.7\r\nservice password-encryption\r\n!\r\n"
+        f"hostname {PROFILE.upper()}-RTR\r\n!\r\n"
+        "enable secret 9 $9$enablefakehash\r\n!\r\n"
+        f"{users}\r\n!\r\n"
+        f"ip local pool SSLVPN_POOL 10.0.251.1 10.0.251.{POOL_SIZE[PROFILE]}\r\n"
+        "ip local pool LAN_DHCP 192.168.50.1 192.168.50.20\r\n!\r\n"
+        "snmp-server community fakecommunity RO\r\n!\r\n"
+        "webvpn context SSL_Context\r\n"
+        " policy group SSL_Policy\r\n"
+        '  svc address-pool "SSLVPN_POOL" netmask 255.255.255.0\r\n'
+        " default-group-policy SSL_Policy\r\n"
+        " inservice\r\n!\r\nend"
+    )
+
+
 def handle_command(cmd: str) -> str:
     parts = cmd.split()
-    if cmd == "terminal length 0":
+    if cmd in ("terminal length 0", "configure terminal", "end", "exit", "write memory"):
         return ""
+    if parts[:1] == ["username"] and len(parts) >= 2:
+        priv = int(parts[parts.index("privilege") + 1]) if "privilege" in parts else 1
+        USERS[PROFILE][:] = [x for x in USERS[PROFILE] if x[0] != parts[1]] + [(parts[1], priv)]
+        return ""
+    if parts[:2] == ["no", "username"] and len(parts) >= 3:
+        USERS[PROFILE][:] = [x for x in USERS[PROFILE] if x[0] != parts[2]]
+        return ""
+    if cmd == "show running-config":
+        return running_config()
+    if cmd == "show ip local pool":
+        with LOCK:
+            used = len(SESSIONS)
+        size = POOL_SIZE[PROFILE]
+        return (" Pool                     Begin           End             Free  In use   Blocked\r\n"
+                f" SSLVPN_POOL              10.0.251.1      10.0.251.{size:<9} {size - used:>5} {used:>7} {0:>9}\r\n"
+                f" LAN_DHCP                 192.168.50.1    192.168.50.20     {12:>3} {8:>7} {0:>9}")
+    if cmd == "show license":
+        return ("Index 1 Feature: ipbasek9\r\n\tPeriod left: Life time\r\n\tLicense Type: Permanent\r\n"
+                "Index 5 Feature: SSL_VPN\r\n\tPeriod left: Life time\r\n\tLicense Type: Permanent\r\n"
+                "\tLicense State: Active, In Use\r\n"
+                f"\tLicense Count: {25 if PROFILE == 'main' else 10}/{len(SESSIONS)}/0  (Active/In-use/Violation)\r\n"
+                "\tLicense Priority: Medium")
     if cmd == "show webvpn session context all":
         return sessions_output()
     if parts[:5] == ["webvpn", "session", "disconnect", "context", "SSL_Context"] and len(parts) == 7 and parts[5] == "name":

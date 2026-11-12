@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 from collections import deque
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 
 from .cisco import (
     DEFAULT_DISCONNECT_COMMAND,
@@ -35,6 +35,18 @@ from .config import (
     router_creds,
 )
 from .geo import fetch_ipinfo, format_ip_summary, is_private_or_local_ip
+from .routercfg import (
+    CONFIG_COMMAND,
+    LICENSE_COMMAND,
+    POOL_COMMAND,
+    ConfigUnavailable,
+    config_diff,
+    config_hash,
+    extract_config,
+    parse_ip_local_pools,
+    parse_sslvpn_license,
+    vpn_pool_names,
+)
 from .storage import ConnectionStatsStore
 from .syslog import FailureCounter, SyslogMessage, SyslogReceiver, classify, is_ignored
 
@@ -50,6 +62,30 @@ DETAIL_COMMAND = "show webvpn session user {login} context {context}"
 VERSION_CHECK_SECONDS = 15 * 60
 # IP phones register/unregister all day long and drown everything else in the router log.
 DEFAULT_SYSLOG_IGNORE = ("IPPHONE-6-",)
+CONFIG_BACKUP_SECONDS = 24 * 3600
+CONFIG_RETRY_SECONDS = 3600
+# After a "configured from console" message: wait a little, the admin is often still typing.
+CONFIG_AFTER_CHANGE_SECONDS = 20
+POOL_CHECK_SECONDS = 5 * 60
+LICENSE_CHECK_SECONDS = 3600
+
+
+def parse_date(value: str) -> date | None:
+    """Access end date: 2026-11-30 (form input) or 30.11.2026 (CSV)."""
+    value = (value or "").strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def person_label(entry: dict | None) -> str:
+    """"Иванов И., бухгалтерия" for messages; empty when the login is not in the directory."""
+    if not entry:
+        return ""
+    return ", ".join(x for x in (entry.get("full_name", ""), entry.get("department", "")) if x)
 
 
 class TelegramNotifier:
@@ -109,6 +145,17 @@ class RouterPoller:
         self._skews: list[int] = []
         self.version_info: dict = {}
         self._last_version_check = 0
+        # Configuration backups
+        self.config_error = ""
+        self._config_due_ts = 0
+        self._config_by: list[str] = []
+        self._config_retry_ts = 0
+        self.vpn_pools: set[str] | None = None
+        # Address pools and AnyConnect licenses
+        self.pool_info: list[dict] = []
+        self.license_info: dict | None = None
+        self._last_pool_check = 0
+        self._last_license_check = 0
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name=f"poll-{router['id']}", daemon=True)
@@ -143,6 +190,7 @@ class RouterPoller:
                 self.poll_once(settings)
                 if self.status == "ok":
                     self.collect_details(settings)
+                    self.periodic_checks(settings)
             except Exception:
                 log.exception("Опрос %s", self.label)
             self._wake.wait(interval)
@@ -232,6 +280,110 @@ class RouterPoller:
         if not known or boot_ts - known > 600:
             store.set_meta(key, str(boot_ts))
 
+    # ------------------------------------------------------------------ config & capacity
+    def periodic_checks(self, settings: dict, now: int | None = None):
+        now = now if now is not None else int(time.time())
+        if settings.get("config_backup_enabled", True):
+            self.maybe_backup_config(settings, now)
+        if now - self._last_pool_check >= POOL_CHECK_SECONDS:
+            self._last_pool_check = now
+            self.check_capacity(settings, now)
+
+    def request_config_backup(self, login: str = ""):
+        """A syslog message said the configuration changed: take a copy shortly."""
+        self._config_due_ts = int(time.time()) + CONFIG_AFTER_CHANGE_SECONDS
+        if login and login not in self._config_by:
+            self._config_by.append(login)
+        self._wake.set()
+
+    def maybe_backup_config(self, settings: dict, now: int):
+        last = int(self.collector.store.get_meta(f"config_checked:{self.id}", "0") or 0)
+        changed = bool(self._config_due_ts) and now >= self._config_due_ts
+        daily = now - last >= CONFIG_BACKUP_SECONDS and now >= self._config_retry_ts
+        if not (changed or daily):
+            return
+        if changed:
+            reason, by = "изменение конфигурации", ", ".join(self._config_by)
+        else:
+            reason, by = ("первая копия" if not last else "ежедневная проверка"), ""
+        self._config_due_ts, self._config_by = 0, []
+        self.backup_config(settings, reason, by, now)
+
+    def backup_config(self, settings: dict, reason: str, changed_by: str = "", now: int | None = None) -> dict:
+        """Read the running configuration and store it if it changed. Never raises."""
+        c = self.collector
+        now = now if now is not None else int(time.time())
+        try:
+            output = self.conn.run(self.creds(), send_cisco_command, CONFIG_COMMAND, timeout=90)
+            text = extract_config(output)
+        except Exception as exc:
+            text_err = str(exc) if isinstance(exc, ConfigUnavailable) else f"не удалось прочитать конфигурацию: {exc}"
+            self._config_retry_ts = now + CONFIG_RETRY_SECONDS
+            if text_err != self.config_error:
+                c.event("ERROR", f"Копия конфигурации {self.label}: {text_err}", router=self.id)
+            self.config_error = text_err
+            c.bump()
+            return {"error": text_err}
+        self.config_error = ""
+        c.store.set_meta(f"config_checked:{self.id}", str(now))
+        self.vpn_pools = vpn_pool_names(text)
+        keep = _safe_int(settings.get("config_keep_versions"), 200)
+        prev = c.store.latest_router_config(self.id)
+        res = c.store.add_router_config(self.id, text, config_hash(text), reason=reason, changed_by=changed_by,
+                                        now_ts=now, keep=keep)
+        if res is None:
+            c.bump()
+            return {"changed": False}
+        who = f" (изменил {changed_by})" if changed_by else ""
+        if res["first"]:
+            c.event("CONFIG", f"Сохранена первая копия конфигурации {self.label}: {text.count(chr(10))} строк",
+                    router=self.id)
+        else:
+            c.event("CONFIG", f"Конфигурация {self.label} изменилась{who}: +{res['added']} −{res['removed']} строк, "
+                              f"копия сохранена", router=self.id)
+            if settings.get("config_diff_telegram", True) and prev:
+                lines = [x for x in config_diff(prev["text"], text, context=0) if not x.startswith("@@")]
+                shown = "\n".join(lines[:25]) + (f"\n… ещё {len(lines) - 25} строк" if len(lines) > 25 else "")
+                c.telegram.send(settings, f"🗂 {c.router_prefix(self.id)}Конфигурация {self.label} изменилась{who}: "
+                                          f"+{res['added']} −{res['removed']}\n{shown}")
+        c.bump()
+        return {"changed": True} | res
+
+    def check_capacity(self, settings: dict, now: int):
+        try:
+            pools = parse_ip_local_pools(self.conn.run(self.creds(), send_cisco_command, POOL_COMMAND, timeout=25))
+        except Exception as exc:
+            log.warning("show ip local pool на %s: %s", self.label, exc)
+            return
+        if self.vpn_pools is None:
+            latest = self.collector.store.latest_router_config(self.id)
+            self.vpn_pools = vpn_pool_names(latest["text"]) if latest else set()
+        for p in pools:
+            # Without a configuration copy every pool counts; with one, only the AnyConnect pools.
+            p["vpn"] = p["name"] in self.vpn_pools if self.vpn_pools else True
+        self.pool_info = pools
+        if now - self._last_license_check >= LICENSE_CHECK_SECONDS:
+            self._last_license_check = now
+            try:
+                self.license_info = parse_sslvpn_license(
+                    self.conn.run(self.creds(), send_cisco_command, LICENSE_COMMAND, timeout=25))
+            except Exception as exc:
+                log.warning("show license на %s: %s", self.label, exc)
+        self.collector.check_capacity(self, settings)
+        self.collector.bump()
+
+    def capacity(self) -> dict:
+        """Pools and licenses for the panel: used / total and percent."""
+        manual = _safe_int(self.router.get("license_limit"), 0)
+        lic = self.license_info or {}
+        limit = manual or int(lic.get("limit") or 0)
+        used = len(self.sessions)
+        license_ = None
+        if limit:
+            license_ = {"limit": limit, "used": used, "percent": round(100 * used / limit),
+                        "source": "settings" if manual else "router", "state": lic.get("state", "")}
+        return {"pools": [p for p in self.pool_info if p.get("vpn", True)], "license": license_}
+
     def collect_details(self, settings: dict):
         """Fetch AnyConnect version/OS/traffic for new sessions and refresh traffic periodically."""
         refresh_min = _safe_int(settings.get("client_details_refresh_minutes"), 30)
@@ -295,6 +447,8 @@ class RouterPoller:
             "sessions": len(self.sessions),
             "clock_skew_seconds": self.clock_skew,
             "version": self.version_info,
+            "capacity": self.capacity(),
+            "config_error": self.config_error,
         }
 
 
@@ -322,6 +476,7 @@ class Collector:
         self.syslog: SyslogReceiver | None = None
         self._auth_failures = FailureCounter(window=600)
         self._config_cmds: dict[str, deque] = {}
+        self._capacity_alerted: set[tuple[str, str]] = set()
         self._router_ips: dict[str, str] = {}
 
         self._maintenance = threading.Thread(target=self._maintenance_loop, name="maintenance", daemon=True)
@@ -486,9 +641,35 @@ class Collector:
         log.info("%s %s%s", event_type, prefix, message)
 
     def alert(self, settings: dict, message: str, login: str = "", ip: str = "", router: str = ""):
+        who = person_label(self.store.get_directory().get(login.lower())) if login else ""
+        if who:
+            message = f"{message} — {who}"
         self.event("ALERT", message, login=login, ip=ip, router=router)
         if settings.get("telegram_notify_alerts", True):
             self.telegram.send(settings, f"🚨 {self.router_prefix(router)}{message}")
+
+    def check_capacity(self, poller: RouterPoller, settings: dict):
+        """Alert once when an AnyConnect address pool or the license count fills up past the threshold."""
+        threshold = _safe_int(settings.get("pool_alert_percent"), 80)
+        if threshold <= 0:
+            return
+        cap = poller.capacity()
+        items = [(f"pool:{p['name']}", f"Пул адресов VPN «{p['name']}»", p["in_use"] + p["blocked"], p["total"])
+                 for p in cap["pools"]]
+        if cap["license"]:
+            items.append(("license", "Лицензии AnyConnect", cap["license"]["used"], cap["license"]["limit"]))
+        for key, label, used, total in items:
+            if total <= 0:
+                continue
+            percent = 100 * used / total
+            state = (poller.id, key)
+            if percent >= threshold and state not in self._capacity_alerted:
+                self._capacity_alerted.add(state)
+                self.alert(settings, f"{label} на {poller.label} заполнен на {round(percent)}%: занято {used} из "
+                                     f"{total}, свободно {max(0, total - used)}. Новые пользователи скоро не "
+                                     f"смогут подключиться", router=poller.id)
+            elif percent < threshold - 5:
+                self._capacity_alerted.discard(state)
 
     def _check_multi_ip(self, settings: dict, seed_only: bool):
         if not settings.get("alert_multi_ip", True):
@@ -565,6 +746,9 @@ class Collector:
             self.event("CONFIG", f"Команда конфигурации — {c.summary}", login=c.login, router=router)
         elif c.kind == "config":
             self.event("CONFIG", c.summary, login=c.login, ip=c.ip, router=router)
+            poller = next((p for p in self.all_pollers() if p.id == router), None)
+            if poller and settings.get("config_backup_enabled", True):
+                poller.request_config_backup(c.login)
             if settings.get("syslog_alert_config", True):
                 recent = [cmd for ts, who, cmd in self._config_cmds.get(router or msg.source_ip, [])
                           if now - ts < 900 and (not c.login or who == c.login)]
@@ -617,8 +801,44 @@ class Collector:
                 from .report import maybe_send_weekly_report
 
                 maybe_send_weekly_report(self, settings)
+                self.check_expiry(settings)
             except Exception:
                 log.exception("Служебные задачи")
+
+    def check_expiry(self, settings: dict, now: float | None = None, force: bool = False) -> str:
+        """Once a day: accounts whose access period is ending or over but still exist on a router."""
+        now_dt = datetime.fromtimestamp(now if now is not None else time.time())
+        today = now_dt.date()
+        if not force:
+            if now_dt.hour < _safe_int(settings.get("expiry_notify_hour"), 9):
+                return ""
+            if self.store.get_meta("expiry_notified_day") == today.isoformat():
+                return ""
+        warn_days = _safe_int(settings.get("expiry_warn_days"), 3)
+        on_router = self.store.router_logins()
+        over, soon = [], []
+        for key, e in sorted(self.store.get_directory().items()):
+            end = parse_date(e.get("expires", ""))
+            if not end or (on_router and key not in on_router):
+                continue  # no end date, or the account is already gone from the routers
+            left = (end - today).days
+            who = person_label(e)
+            line = f"{e['login']}{f' ({who})' if who else ''} — доступ до {end:%d.%m.%Y}"
+            if left < 0:
+                over.append(f"⛔ {line}, срок истёк {-left} дн. назад")
+            elif left <= warn_days:
+                soon.append(f"⚠ {line}" + (", сегодня последний день" if left == 0 else f", осталось {left} дн."))
+        if not force:
+            self.store.set_meta("expiry_notified_day", today.isoformat())
+        if not (over or soon):
+            return ""
+        text = "Сроки доступа к VPN:\n" + "\n".join(over + soon)
+        if over:
+            text += "\nУчётки с истёкшим сроком есть в списке «Учётки на удаление» с готовыми командами."
+        self.event("ALERT" if over else "INFO", text.replace("\n", " "))
+        if settings.get("telegram_notify_alerts", True):
+            self.telegram.send(settings, "⏳ " + text)
+        return text
 
     def _maybe_backup(self, settings: dict, force: bool = False) -> str:
         today = datetime.now().strftime("%Y-%m-%d")

@@ -26,7 +26,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 from . import __version__
 from .cisco import CiscoConnection, VpnSession, clean_text, is_outdated
 from .cleanup import build_cleanup
-from .collector import Collector, TelegramNotifier
+from .collector import Collector, TelegramNotifier, parse_date
+from .routercfg import config_diff, mask_config
 from .config import (
     BACKUP_DIR,
     DATA_DIR,
@@ -134,6 +135,32 @@ SETTING_DEFAULTS |= {
     "syslog_alert_interfaces": True,
     "syslog_auth_fail_threshold": 5,
 }
+PUBLIC_SETTINGS |= {
+    "config_backup_enabled": bool,
+    "config_keep_versions": int,
+    "config_diff_telegram": bool,
+    "pool_alert_percent": int,
+    "expiry_warn_days": int,
+    "expiry_notify_hour": int,
+}
+SETTING_DEFAULTS |= {
+    "config_backup_enabled": True,
+    "config_keep_versions": 200,
+    "config_diff_telegram": True,
+    "pool_alert_percent": 80,
+    "expiry_warn_days": 3,
+    "expiry_notify_hour": 9,
+}
+DIRECTORY_COLUMNS = ("login", "full_name", "department", "phone", "comment", "expires")
+# Column names accepted in an imported CSV header (case-insensitive).
+DIRECTORY_HEADERS = {
+    "login": "login", "логин": "login", "учётка": "login", "учетка": "login", "username": "login",
+    "full_name": "full_name", "фио": "full_name", "name": "full_name", "имя": "full_name", "сотрудник": "full_name",
+    "department": "department", "отдел": "department", "подразделение": "department",
+    "phone": "phone", "телефон": "phone",
+    "comment": "comment", "комментарий": "comment", "примечание": "comment",
+    "expires": "expires", "срок": "expires", "доступ до": "expires", "срок доступа": "expires",
+}
 
 # ------------------------------------------------------------------ panel users and roles
 BUILTIN_ADMIN = "admin"
@@ -150,6 +177,8 @@ ADMIN_ONLY = {
     ("POST", "/api/users/sync"), ("POST", "/api/users/import"), ("POST", "/api/users/remove"),
     ("POST", "/api/server/restart"), ("POST", "/api/server/shutdown"),
     ("GET", "/api/web-users"), ("POST", "/api/web-users/save"), ("POST", "/api/web-users/delete"),
+    ("GET", "/api/configs/download"), ("POST", "/api/configs/backup"),
+    ("POST", "/api/directory/save"), ("POST", "/api/directory/delete"), ("POST", "/api/directory/import"),
 }
 
 
@@ -306,6 +335,14 @@ def coerce_settings(payload: dict) -> dict:
         raise ApiError(400, "Доступ: только этот компьютер или вся сеть")
     if "web_port" in changes and not 1024 <= changes["web_port"] <= 65535:
         raise ApiError(400, "Порт панели — от 1024 до 65535")
+    if "config_keep_versions" in changes and not 10 <= changes["config_keep_versions"] <= 5000:
+        raise ApiError(400, "Хранить копий конфигурации — от 10 до 5000")
+    if "pool_alert_percent" in changes and not 0 <= changes["pool_alert_percent"] <= 100:
+        raise ApiError(400, "Порог заполнения — от 0 до 100% (0 — не предупреждать)")
+    if "expiry_warn_days" in changes and not 0 <= changes["expiry_warn_days"] <= 60:
+        raise ApiError(400, "Предупреждать об окончании доступа — за 0–60 дней")
+    if "expiry_notify_hour" in changes and not 0 <= changes["expiry_notify_hour"] <= 23:
+        raise ApiError(400, "Часы должны быть от 0 до 23")
     if "min_client_version" in changes and changes["min_client_version"] and \
             not all(p.isdigit() for p in changes["min_client_version"].split(".")):
         raise ApiError(400, "Минимальная версия — в виде 4.10 или 4.10.08025")
@@ -316,8 +353,33 @@ def coerce_settings(payload: dict) -> dict:
     return changes
 
 
+def parse_directory_csv(text: str) -> list[dict]:
+    """Rows from pasted CSV/Excel text: `;`, `,` or tab separated, with or without a header.
+
+    Without a header the columns are: login, full name, department, phone, comment, access end date.
+    """
+    text = text.lstrip("\ufeff").strip()
+    if not text:
+        return []
+    first = text.split("\n", 1)[0]
+    delimiter = max(("\t", ";", ","), key=first.count)
+    reader = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+    header = [DIRECTORY_HEADERS.get(c.strip().lower()) for c in reader[0]]
+    if "login" in header:
+        columns, body = header, reader[1:]
+    else:
+        columns, body = list(DIRECTORY_COLUMNS), reader
+    rows = []
+    for cells in body:
+        row = {col: cells[i].strip() for i, col in enumerate(columns) if col and i < len(cells)}
+        if row.get("login"):
+            rows.append(row)
+    return rows
+
+
 def router_public(r: dict) -> dict:
-    return {k: r[k] for k in ("id", "name", "host", "port", "username", "disconnect_command", "enabled")} | {
+    return {k: r.get(k) for k in ("id", "name", "host", "port", "username", "disconnect_command", "enabled",
+                                  "license_limit")} | {
         "password_set": bool(r.get("password_encoded")),
     }
 
@@ -486,6 +548,15 @@ def make_handler(app: App):
                 ("GET", "/api/web-users"): self.web_users,
                 ("POST", "/api/web-users/save"): self.save_web_user,
                 ("POST", "/api/web-users/delete"): self.delete_web_user,
+                ("GET", "/api/configs"): self.configs,
+                ("GET", "/api/configs/view"): self.config_view,
+                ("GET", "/api/configs/download"): self.config_download,
+                ("POST", "/api/configs/backup"): self.config_backup,
+                ("GET", "/api/directory"): self.directory,
+                ("POST", "/api/directory/save"): self.directory_save,
+                ("POST", "/api/directory/delete"): self.directory_delete,
+                ("POST", "/api/directory/import"): self.directory_import,
+                ("GET", "/api/export/directory.csv"): self.directory_export,
             }
 
         @property
@@ -618,6 +689,158 @@ def make_handler(app: App):
             app.collector.event("ADMIN", f"Пользователь панели {login} удалён ({self.actor})")
             self.send_json({"ok": True})
 
+        # -------------------------------------------------------------- router configuration
+        def configs(self, q):
+            names = {p.id: p.label for p in app.collector.all_pollers()}
+            versions = app.store.list_router_configs(q.get("router", ""))
+            for v in versions:
+                v["router_name"] = names.get(v["router"], v["router"])
+            routers = []
+            for p in app.collector.all_pollers():
+                last = int(app.store.get_meta(f"config_checked:{p.id}", "0") or 0)
+                routers.append({"id": p.id, "name": p.label, "checked_ts": last, "error": p.config_error,
+                                "count": sum(1 for v in versions if v["router"] == p.id)})
+            self.send_json({"routers": routers, "versions": versions,
+                            "enabled": setting(load_settings(), "config_backup_enabled")})
+
+        def _config(self, q) -> dict:
+            try:
+                cfg = app.store.get_router_config(int(q.get("id", "")))
+            except ValueError:
+                cfg = None
+            if not cfg:
+                raise ApiError(404, "Копия конфигурации не найдена")
+            return cfg
+
+        def config_view(self, q):
+            cfg = self._config(q)
+            meta = {k: v for k, v in cfg.items() if k != "text"}
+            if q.get("mode") == "full":
+                return self.send_json({"meta": meta, "text": mask_config(cfg["text"])})
+            other = None
+            if q.get("against"):
+                other = self._config({"id": q["against"]})
+                if other["router"] != cfg["router"]:
+                    raise ApiError(400, "Сравнивать можно копии одного устройства")
+                if other["ts"] > cfg["ts"]:
+                    cfg, other = other, cfg
+            else:
+                other = app.store.previous_router_config(cfg["id"])
+            self.send_json({
+                "meta": meta,
+                "against": {k: v for k, v in other.items() if k != "text"} if other else None,
+                "diff": config_diff(other["text"], cfg["text"]) if other else [],
+            })
+
+        def config_download(self, q):
+            cfg = self._config(q)
+            name = re.sub(r"[^\w.-]", "_", cfg["router"])
+            stamp = time.strftime("%Y%m%d-%H%M", time.localtime(cfg["ts"]))
+            app.collector.event("ADMIN", f"Скачана полная копия конфигурации ({self.actor})", router=cfg["router"])
+            self.send_bytes(cfg["text"].replace("\n", "\r\n").encode("utf-8"), "text/plain; charset=utf-8", extra={
+                "Content-Disposition": f'attachment; filename="config-{name}-{stamp}.txt"',
+                "Cache-Control": "no-store",
+            })
+
+        def config_backup(self, _q):
+            rid = str(self.read_json().get("router") or "")
+            results = []
+            for p in app.collector.all_pollers():
+                if rid and p.id != rid:
+                    continue
+                if p.status != "ok":
+                    results.append({"router": p.id, "name": p.label, "error": p.last_error or "нет связи"})
+                    continue
+                res = p.backup_config(load_settings(), f"вручную ({self.user['login']})")
+                results.append({"router": p.id, "name": p.label} | {k: res.get(k) for k in ("changed", "error",
+                                                                                            "added", "removed")})
+            if not results:
+                raise ApiError(404, "Нет устройств")
+            self.send_json({"routers": results})
+
+        # -------------------------------------------------------------- employee directory
+        def directory(self, _q):
+            entries = app.store.get_directory()
+            on_router = app.store.router_logins()
+            synced = any(app.store.get_meta(f"router_users_synced:{r['id']}") for r in get_routers())
+            logins = {x.lower(): x for x in app.store.known_logins()}
+            logins.update({k: e["login"] for k, e in entries.items()})
+            today = time.localtime()
+            today_iso = f"{today.tm_year:04d}-{today.tm_mon:02d}-{today.tm_mday:02d}"
+            rows = []
+            for key, login in logins.items():
+                e = entries.get(key, {})
+                end = parse_date(e.get("expires", ""))
+                rows.append({
+                    "login": login,
+                    **{k: e.get(k, "") for k in DIRECTORY_COLUMNS[1:]},
+                    "expires": end.isoformat() if end else e.get("expires", ""),
+                    "days_left": (end - parse_date(today_iso)).days if end else None,
+                    "on_router": (key in on_router) if synced else None,
+                    "has_entry": bool(e),
+                })
+            rows.sort(key=lambda r: r["login"].lower())
+            self.send_json({"entries": rows, "synced": synced,
+                            "warn_days": setting(load_settings(), "expiry_warn_days")})
+
+        @staticmethod
+        def _clean_entry(raw: dict) -> dict:
+            e = {k: str(raw.get(k) or "").strip()[:200] for k in DIRECTORY_COLUMNS}
+            if not e["login"] or any(c.isspace() for c in e["login"]):
+                raise ApiError(400, f"Некорректный логин: «{e['login']}»")
+            if e["expires"]:
+                end = parse_date(e["expires"])
+                if not end:
+                    raise ApiError(400, f"{e['login']}: дата «{e['expires']}» — нужна в виде 30.11.2026")
+                e["expires"] = end.isoformat()
+            return e
+
+        def directory_save(self, _q):
+            e = self._clean_entry(self.read_json())
+            app.store.save_directory_entries([e])
+            app.collector.event("ADMIN", f"Справочник: сохранены данные учётки {e['login']} ({self.actor})",
+                                login=e["login"])
+            app.collector.bump()
+            self.send_json({"ok": True})
+
+        def directory_delete(self, _q):
+            login = str(self.read_json().get("login", "")).strip()
+            removed = app.store.delete_directory_entry(login)
+            if removed:
+                app.collector.event("ADMIN", f"Справочник: удалены данные учётки {login} ({self.actor})", login=login)
+                app.collector.bump()
+            self.send_json({"removed": removed})
+
+        def directory_import(self, _q):
+            text = str(self.read_json().get("text", ""))
+            rows = parse_directory_csv(text)
+            if not rows:
+                raise ApiError(400, "Не найдено ни одной строки с логином")
+            entries, errors = [], []
+            for i, r in enumerate(rows, 1):
+                try:
+                    entries.append(self._clean_entry(r))
+                except ApiError as exc:
+                    errors.append(f"строка {i}: {exc}")
+            if errors:
+                raise ApiError(400, "; ".join(errors[:5]) + (f" и ещё {len(errors) - 5}" if len(errors) > 5 else ""))
+            n = app.store.save_directory_entries(entries)
+            app.collector.event("ADMIN", f"Справочник: импортировано {n} записей ({self.actor})")
+            app.collector.bump()
+            self.send_json({"imported": n})
+
+        def directory_export(self, _q):
+            buf = io.StringIO()
+            w = csv.writer(buf, delimiter=";")
+            w.writerow(["Логин", "ФИО", "Отдел", "Телефон", "Комментарий", "Доступ до"])
+            for e in sorted(app.store.get_directory().values(), key=lambda x: x["login"].lower()):
+                end = parse_date(e["expires"])
+                w.writerow([e["login"], e["full_name"], e["department"], e["phone"], e["comment"],
+                            end.strftime("%d.%m.%Y") if end else ""])
+            self.send_bytes(("\ufeff" + buf.getvalue()).encode("utf-8"), "text/csv; charset=utf-8", extra={
+                "Content-Disposition": f'attachment; filename="vpn-directory-{time.strftime("%Y%m%d")}.csv"',
+            })
+
         # -------------------------------------------------------------- router syslog
         def syslog_messages(self, q):
             settings = load_settings()
@@ -657,6 +880,11 @@ def make_handler(app: App):
             snap["min_client_version"] = minimum
             snap["user"] = {"login": self.user["login"], "role": self.user["role"]}
             snap["syslog"] = app.collector.syslog_state()
+            snap["people"] = {k: {"name": e["full_name"], "dept": e["department"], "expires": e["expires"]}
+                              for k, e in app.store.get_directory().items()}
+            settings = load_settings()
+            snap["expiry_warn_days"] = setting(settings, "expiry_warn_days")
+            snap["pool_alert_percent"] = setting(settings, "pool_alert_percent")
             self.send_json(snap)
 
         def refresh(self, _q):
@@ -831,6 +1059,10 @@ def make_handler(app: App):
                 raise ApiError(400, "Некорректный SSH-порт")
             if "enabled" in data:
                 r["enabled"] = bool(data["enabled"])
+            try:
+                r["license_limit"] = max(0, int(data.get("license_limit", r.get("license_limit", 0)) or 0))
+            except (TypeError, ValueError):
+                raise ApiError(400, "Число лицензий — целое число (0 — определить по роутеру)")
             if data.get("password"):
                 r["password_encoded"] = encode_password(str(data["password"]))
             if not r.get("host"):

@@ -113,7 +113,8 @@ def decode_password(stored: str) -> str:
 
 
 DEFAULT_ROUTER_ID = "main"
-ROUTER_FIELDS = ("id", "name", "host", "port", "username", "password_encoded", "disconnect_command", "enabled")
+ROUTER_FIELDS = ("id", "name", "host", "port", "username", "password_encoded", "disconnect_command", "enabled",
+                 "license_limit")
 
 
 def get_routers(settings: dict | None = None) -> list[dict]:
@@ -141,6 +142,10 @@ def get_routers(settings: dict | None = None) -> list[dict]:
             port = int(r.get("port", 22))
         except (TypeError, ValueError):
             port = 22
+        try:
+            license_limit = max(0, int(r.get("license_limit") or 0))
+        except (TypeError, ValueError):
+            license_limit = 0
         out.append({
             "id": str(r["id"]),
             "name": str(r.get("name") or r.get("host") or r["id"]).strip(),
@@ -150,6 +155,7 @@ def get_routers(settings: dict | None = None) -> list[dict]:
             "password_encoded": str(r.get("password_encoded", "")),
             "disconnect_command": str(r.get("disconnect_command", "")).strip(),
             "enabled": bool(r.get("enabled", True)),
+            "license_limit": license_limit,
         })
     return out
 

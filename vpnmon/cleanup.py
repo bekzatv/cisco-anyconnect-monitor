@@ -1,4 +1,4 @@
-"""Accounts to remove: local router users without VPN activity for N days.
+"""Accounts to remove: local router users without VPN activity for N days, or whose access period is over.
 
 The panel only prepares the list and the commands; nothing is ever sent to the router.
 """
@@ -31,7 +31,11 @@ def build_cleanup(store: ConnectionStatsStore, routers: list[dict], idle_days: i
                   exclude: set[str], now_ts: int | None = None) -> dict:
     now_ts = now_ts if now_ts is not None else int(time.time())
     exclude = {x.strip().lower() for x in exclude if x.strip()}
+    from .collector import parse_date, person_label
+
     result = {"idle_days": idle_days, "generated": _date(now_ts), "routers": []}
+    directory = store.get_directory()
+    today = datetime.fromtimestamp(now_ts).date()
     for router in routers:
         users, observed_since = store.get_router_user_activity(router["id"])
         synced = store.get_meta(f"router_users_synced:{router['id']}")
@@ -62,25 +66,37 @@ def build_cleanup(store: ConnectionStatsStore, routers: list[dict], idle_days: i
             if login.lower() in exclude:
                 entry["excluded"].append({"login": login, "reason": "в списке исключений"})
                 continue
+            person = directory.get(login.lower())
+            end = parse_date(person.get("expires", "")) if person else None
+            expired = bool(end and end < today)
+            last_ts = int(u["last_ts"]) if u["last_ts"] else None
+            candidate = {
+                "login": login,
+                "privilege": u["privilege"],
+                "last_activity": _date(last_ts) if last_ts else "",
+                "idle_days": 0,
+                "never": last_ts is None,
+                "person": person_label(person),
+                "expired": end.strftime("%d.%m.%Y") if expired else "",
+                "online": bool(u["online"]),
+            }
+            if observed_since:
+                idle_since = last_ts or max(observed_since, int(u["first_synced_ts"] or 0))
+                candidate["idle_days"] = max(0, (now_ts - idle_since) // 86400)
+            # An expired access period is a reason on its own, however recently the account was used.
+            if expired:
+                entry["candidates"].append(candidate)
+                continue
             if u["online"]:
                 entry["active"] += 1
                 continue
             if not observed_since:
                 continue
-            last_ts = int(u["last_ts"]) if u["last_ts"] else None
-            idle_since = last_ts or max(observed_since, int(u["first_synced_ts"] or 0))
-            days = (now_ts - idle_since) // 86400
-            if days >= idle_days:
-                entry["candidates"].append({
-                    "login": login,
-                    "privilege": u["privilege"],
-                    "last_activity": _date(last_ts) if last_ts else "",
-                    "idle_days": days,
-                    "never": last_ts is None,
-                })
+            if candidate["idle_days"] >= idle_days:
+                entry["candidates"].append(candidate)
             else:
                 entry["active"] += 1
-        entry["candidates"].sort(key=lambda c: (-c["idle_days"], c["login"].lower()))
+        entry["candidates"].sort(key=lambda c: (not c["expired"], -c["idle_days"], c["login"].lower()))
         entry["commands"] = cleanup_commands(entry, idle_days, now_ts)
         result["routers"].append(entry)
     return result
@@ -90,9 +106,11 @@ def cleanup_commands(entry: dict, idle_days: int, now_ts: int) -> str:
     if not entry["candidates"]:
         return ""
     n = len(entry["candidates"])
+    expired = sum(1 for c in entry["candidates"] if c.get("expired"))
+    why = f"без входа {idle_days}+ дней" + (f" или с истёкшим сроком доступа ({expired})" if expired else "")
     lines = [
-        f"! {entry['name']} ({entry['host']}): {n} {plural(n, 'учётка', 'учётки', 'учёток')} без входа "
-        f"{idle_days}+ дней, список от {_date(now_ts)}",
+        f"! {entry['name']} ({entry['host']}): {n} {plural(n, 'учётка', 'учётки', 'учёток')} {why}, "
+        f"список от {_date(now_ts)}",
         "! Проверьте список перед применением. Пустая строка после каждой команды",
         "! подтверждает вопрос IOS [confirm].",
         "configure terminal",

@@ -386,3 +386,22 @@ body.viewer .admin-only { display: none !important; }
   .mini-kpis { grid-template-columns: repeat(2, 1fr); }
   .topbar { flex-wrap: wrap; align-items: flex-start; }
 }
+
+/* Employee directory */
+small.person { display: block; font-weight: 400; color: var(--muted); font-size: 12px; margin-top: 1px; white-space: normal; }
+td.login small.person { max-width: 260px; }
+
+/* Router configuration */
+.cfg-grid { grid-template-columns: minmax(320px, 2fr) 3fr; align-items: start; }
+.cfg-grid .table-wrap { max-height: calc(100vh - 260px); }
+#cfg-view pre.commands { max-height: calc(100vh - 300px); white-space: pre; }
+pre.diff span { display: block; }
+pre.diff .add { background: var(--good-soft); color: var(--good); }
+pre.diff .del { background: var(--bad-soft); color: var(--bad); }
+pre.diff .hunk { color: var(--muted); }
+.error-text.inline { display: inline; min-height: 0; margin: 0; }
+#cfg-status p { margin: 4px 0; }
+@media (max-width: 860px) {
+  .cfg-grid { grid-template-columns: 1fr; }
+}
+.table .actions .btn.sm { margin-top: 0; }
