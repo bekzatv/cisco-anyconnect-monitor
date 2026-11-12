@@ -851,11 +851,21 @@ class ConnectionStatsStore:
     # -------------------------------------------------------------------------
     def sync_router_users(self, router: str, entries: list[tuple[str, int]],
                           now_ts: int | None = None) -> dict:
+        """Replace the stored user list of one router with what its config has now.
+
+        A login deleted on the router is dropped from router_users and, unless another
+        router still has it, from the monitor's user list too. Session history stays.
+        """
         now_ts = now_ts if now_ts is not None else int(time.time())
         logins = {login.lower(): (login, priv) for login, priv in entries if login}
+        if not logins:
+            # The monitor's own account is always in the config: an empty list means the
+            # output was not parsed, and wiping every account on that basis would be wrong.
+            raise ValueError("в конфиге роутера не найдено ни одной учётки, список не изменён")
+        removed_names: list[str] = []
         with self._lock:
             with self._connect() as conn:
-                before = {r["login"].lower() for r in conn.execute(
+                before = {r["login"].lower(): r["login"] for r in conn.execute(
                     "SELECT login FROM router_users WHERE router = ?", (router,))}
                 for login, priv in logins.values():
                     conn.execute(
@@ -867,13 +877,21 @@ class ConnectionStatsStore:
                         """,
                         (router, login, priv, now_ts, now_ts),
                     )
-                removed = before - set(logins)
-                for login in removed:
-                    conn.execute("DELETE FROM router_users WHERE router = ? AND login = ?", (router, login))
+                for key in sorted(set(before) - set(logins)):
+                    name = before[key]
+                    conn.execute("DELETE FROM router_users WHERE router = ? AND login = ? COLLATE NOCASE",
+                                 (router, name))
+                    still_elsewhere = conn.execute(
+                        "SELECT 1 FROM router_users WHERE login = ? COLLATE NOCASE LIMIT 1", (name,)
+                    ).fetchone()
+                    if not still_elsewhere:
+                        conn.execute("DELETE FROM known_users WHERE login = ? COLLATE NOCASE", (name,))
+                    removed_names.append(name)
                 conn.commit()
         self.register_known_users([v[0] for v in logins.values()], source="router", now_ts=now_ts)
         self.set_meta(f"router_users_synced:{router}", str(now_ts))
-        return {"total": len(logins), "added": len(set(logins) - before), "removed": len(removed)}
+        return {"total": len(logins), "added": len(set(logins) - set(before)),
+                "removed": len(removed_names), "removed_logins": removed_names}
 
     def get_admin_logins(self, min_privilege: int = 15) -> set[str]:
         """Router admin accounts (privilege 15): device management, not VPN users."""

@@ -909,6 +909,9 @@ def make_handler(app: App):
                 try:
                     entries = app.collector.router_user_entries(r["id"])
                     res = app.store.sync_router_users(r["id"], entries)
+                    for login in res["removed_logins"]:
+                        app.collector.event("INFO", f"Учётка '{login}' удалена с роутера, убрана из монитора",
+                                            login=login, router=r["id"])
                     results.append({"router": r["id"], "name": r["name"], "found": res["total"], **res})
                 except Exception as exc:
                     results.append({"router": r["id"], "name": r["name"], "error": str(exc)})
@@ -918,6 +921,9 @@ def make_handler(app: App):
                 "routers": results,
                 "found": sum(x.get("found", 0) for x in results),
                 "added": sum(x.get("added", 0) for x in results),
+                "removed": sum(x.get("removed", 0) for x in results),
+                "removed_logins": sorted({n for x in results for n in x.get("removed_logins", [])},
+                                         key=str.lower),
             })
 
         def users_import(self, _q):

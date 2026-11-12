@@ -123,6 +123,28 @@ class CleanupTest(Base):
         users, _ = self.store.get_router_user_activity("a")
         self.assertEqual([u["login"] for u in users], ["used"])
 
+    def known(self):
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(self.dir / "s.db")) as conn:
+            return sorted(r[0] for r in conn.execute("SELECT login FROM known_users"))
+
+    def test_resync_drops_deleted_user_from_monitor_list(self):
+        self.store.sync_router_users("a", [("Ivanov", 0), ("petrov", 0), ("shared", 0)], now_ts=T0)
+        self.store.sync_router_users("b", [("shared", 0)], now_ts=T0)
+        res = self.store.sync_router_users("a", [("petrov", 0)], now_ts=T0 + DAY)
+        # Mixed-case login is removed too; "shared" stays: router b still has it.
+        self.assertEqual(sorted(res["removed_logins"]), ["Ivanov", "shared"])
+        self.assertEqual(self.known(), ["petrov", "shared"])
+        users, _ = self.store.get_router_user_activity("a")
+        self.assertEqual([u["login"] for u in users], ["petrov"])
+
+    def test_empty_router_list_changes_nothing(self):
+        self.store.sync_router_users("a", [("petrov", 0)], now_ts=T0)
+        with self.assertRaises(ValueError):
+            self.store.sync_router_users("a", [], now_ts=T0 + DAY)
+        self.assertEqual(self.known(), ["petrov"])
+
 
 class FakeCollector:
     def __init__(self, store):

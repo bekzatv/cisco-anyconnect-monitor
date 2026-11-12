@@ -1048,7 +1048,8 @@ function wire() {
     try {
       const r = await api("POST", "/api/users/sync");
       const errors = r.routers.filter((x) => x.error);
-      toast(`Учёток в конфигах: ${r.found}, новых: ${r.added}${errors.length ? `. Ошибки: ${errors.map((x) => x.name).join(", ")}` : ""}`, errors.length > 0);
+      const gone = r.removed ? `, удалено: ${r.removed} (${r.removed_logins.slice(0, 10).join(", ")}${r.removed > 10 ? "…" : ""})` : "";
+      toast(`Учёток в конфигах: ${r.found}, новых: ${r.added}${gone}${errors.length ? `. Ошибки: ${errors.map((x) => x.name).join(", ")}` : ""}`, errors.length > 0);
       loadCleanup($("#c-days").value);
     } catch (err) { toast(err.message, true); }
     finally { b.disabled = false; }
