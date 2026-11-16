@@ -1,3 +1,4 @@
 """Cisco AnyConnect Monitor core: Cisco SSH access, connection statistics, collector and web panel."""
 
-__version__ = "4.4"
+__version__ = "4.5"
+REPOSITORY = "bekzatv/cisco-anyconnect-monitor"

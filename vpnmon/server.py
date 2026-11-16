@@ -28,6 +28,7 @@ from .cisco import CiscoConnection, VpnSession, clean_text, is_outdated
 from .cleanup import build_cleanup, mark_deleted_accounts
 from .collector import Collector, TelegramNotifier, parse_date
 from .routercfg import config_diff, mask_config
+from .updates import update_state
 from .config import (
     BACKUP_DIR,
     DATA_DIR,
@@ -142,6 +143,7 @@ PUBLIC_SETTINGS |= {
     "pool_alert_percent": int,
     "expiry_warn_days": int,
     "expiry_notify_hour": int,
+    "update_check_enabled": bool,
 }
 SETTING_DEFAULTS |= {
     "config_backup_enabled": True,
@@ -150,6 +152,7 @@ SETTING_DEFAULTS |= {
     "pool_alert_percent": 80,
     "expiry_warn_days": 3,
     "expiry_notify_hour": 9,
+    "update_check_enabled": True,
 }
 DIRECTORY_COLUMNS = ("login", "full_name", "department", "phone", "comment", "expires")
 # Column names accepted in an imported CSV header (case-insensitive).
@@ -178,6 +181,7 @@ ADMIN_ONLY = {
     ("POST", "/api/server/restart"), ("POST", "/api/server/shutdown"),
     ("GET", "/api/web-users"), ("POST", "/api/web-users/save"), ("POST", "/api/web-users/delete"),
     ("GET", "/api/configs/download"), ("POST", "/api/configs/backup"),
+    ("POST", "/api/update/check"),
     ("POST", "/api/directory/save"), ("POST", "/api/directory/delete"), ("POST", "/api/directory/import"),
 }
 
@@ -548,6 +552,8 @@ def make_handler(app: App):
                 ("GET", "/api/web-users"): self.web_users,
                 ("POST", "/api/web-users/save"): self.save_web_user,
                 ("POST", "/api/web-users/delete"): self.delete_web_user,
+                ("GET", "/api/update"): self.update_info,
+                ("POST", "/api/update/check"): self.update_check,
                 ("GET", "/api/configs"): self.configs,
                 ("GET", "/api/configs/view"): self.config_view,
                 ("GET", "/api/configs/download"): self.config_download,
@@ -883,6 +889,9 @@ def make_handler(app: App):
             snap["people"] = {k: {"name": e["full_name"], "dept": e["department"], "expires": e["expires"]}
                               for k, e in app.store.get_directory().items()}
             settings = load_settings()
+            upd = update_state(app.store)
+            snap["update"] = {"version": upd["latest"]["version"], "url": upd["latest"]["url"]} \
+                if upd["available"] and setting(settings, "update_check_enabled") else None
             snap["expiry_warn_days"] = setting(settings, "expiry_warn_days")
             snap["pool_alert_percent"] = setting(settings, "pool_alert_percent")
             self.send_json(snap)
@@ -1231,6 +1240,16 @@ def make_handler(app: App):
                 "certificate": certificate_info() if run["web_https"] else {},
                 "client_is_local": is_loopback(self.client_ip),
             })
+
+        def update_info(self, _q):
+            self.send_json(update_state(app.store) | {
+                "enabled": setting(load_settings(), "update_check_enabled")})
+
+        def update_check(self, _q):
+            state = app.collector.check_update(load_settings(), force=True)
+            if state["error"]:
+                raise ApiError(502, f"Не удалось связаться с GitHub: {state['error']}")
+            self.send_json(state)
 
         def restart(self, _q):
             app.collector.event("INFO", f"Перезапуск сервера из веб-панели ({self.actor})")

@@ -405,3 +405,7 @@ pre.diff .hunk { color: var(--muted); }
   .cfg-grid { grid-template-columns: 1fr; }
 }
 .table .actions .btn.sm { margin-top: 0; }
+
+/* Update notice */
+.update-note { display: block; margin: -4px 0 10px 16px; font-size: 12px; color: #fbbf24; text-decoration: none; }
+.update-note:hover { text-decoration: underline; }

@@ -38,6 +38,7 @@
       </nav>
       <div class="sidebar-foot">
         <div id="collector-status" class="collector"><span class="dot"></span><span class="txt">Подключение…</span></div>
+        <a class="update-note hidden admin-only" id="update-note" target="_blank" rel="noopener noreferrer"></a>
         <div class="whoami" id="whoami"></div>
         <div class="foot-actions">
           <button class="btn ghost sm" id="theme-toggle" type="button" title="Сменить тему">◐ Тема</button>
@@ -380,6 +381,7 @@
             <label>Хранить копий на устройство<input name="config_keep_versions" type="number" min="10" max="5000" class="narrow-input"></label>
             <label>Тревога: пул адресов или лицензии AnyConnect заполнены на, %<input name="pool_alert_percent" type="number" min="0" max="100" class="narrow-input" title="0 — не предупреждать"></label>
             <p class="muted small">Изменения ловятся по сообщению роутера «Configured from …» в его журнале (syslog), поэтому для копий сразу после изменения нужен настроенный приём журнала. Пароли и ключи в панели скрыты; полную копию может скачать только администратор.</p>
+            <label class="switch"><input type="checkbox" name="update_check_enabled"><span></span>Раз в сутки проверять на GitHub, не вышла ли новая версия монитора</label>
             <h3>Сроки доступа</h3>
             <div class="form-grid">
               <label>Предупреждать за, дней<input name="expiry_warn_days" type="number" min="0" max="60"></label>
@@ -409,6 +411,8 @@
           <div class="card admin-only">
             <h2>Сервер</h2>
             <p class="muted small" id="server-info"></p>
+            <p class="small" id="update-info"></p>
+            <button class="btn sm" type="button" id="update-check">Проверить обновления</button>
             <h3>Резервные копии базы</h3>
             <p class="muted small">Делаются автоматически раз в сутки в папку <code>backups</code> рядом с программой.</p>
             <ul class="backup-list" id="backup-list"></ul>

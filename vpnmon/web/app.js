@@ -332,6 +332,9 @@ async function pollState() {
   else statusText = "Запуск…";
   setCollector(st.status, statusText);
   $("#nav-sessions").textContent = st.kpi.sessions;
+  const note = $("#update-note");
+  note.classList.toggle("hidden", !st.update);
+  if (st.update) { note.textContent = `⬆ Доступна версия ${st.update.version}`; note.href = st.update.url; }
   const expiring = Object.values(st.people || {}).filter((p) => p.expires && daysUntil(p.expires) <= (st.expiry_warn_days ?? 3)).length;
   $("#nav-expiry").textContent = expiring;
   $("#nav-expiry").classList.toggle("hidden", !expiring);
@@ -953,7 +956,23 @@ async function loadSettings() {
   } catch (err) { toast(err.message, true); }
 }
 
+function renderUpdate(u) {
+  const el = $("#update-info");
+  if (u.available) {
+    el.innerHTML = `<b class="warn-text">Доступна версия ${esc(u.latest.version)}</b>${u.latest.published ? ` от ${esc(fmtIsoDate(u.latest.published))}` : ""} — установлена ${esc(u.current)}. `
+      + `<a class="link" target="_blank" rel="noopener noreferrer" href="${esc(u.latest.url)}">Что нового и загрузка →</a><br>`
+      + `<span class="muted">Чтобы обновить: скачайте архив server-package, распакуйте на сервере и запустите Install-Server.bat от имени администратора. База и настройки сохранятся.</span>`;
+  } else if (u.error && !u.checked_ts) {
+    el.innerHTML = `<span class="muted">Проверить обновления не удалось (${esc(u.error)}). Если у сервера нет выхода в интернет, смотрите новые версии на <a class="link" target="_blank" rel="noopener noreferrer" href="${esc(u.releases_url)}">странице релизов</a>.</span>`;
+  } else if (!u.checked_ts) {
+    el.innerHTML = `<span class="muted">${u.enabled ? "Обновления ещё не проверялись — первая проверка в течение пары минут после запуска." : "Автоматическая проверка обновлений выключена."}</span>`;
+  } else {
+    el.innerHTML = `<span class="ok-text">Установлена последняя версия (${esc(u.current)}).</span> <span class="muted">Проверено ${esc(ago(u.checked_ts))}${u.error ? `; последняя попытка не удалась: ${esc(u.error)}` : ""}.</span>`;
+  }
+}
+
 async function loadServerInfo() {
+  try { renderUpdate(await api("GET", "/api/update")); } catch (err) { /* shown by the next call */ }
   try {
     const info = await api("GET", "/api/server/info");
     $("#server-info").innerHTML = `Версия ${esc(info.version)} на компьютере <b>${esc(info.hostname)}</b>, часовой пояс сервера ${esc(info.timezone)}. `
@@ -1406,6 +1425,17 @@ function wire() {
     const target = info ? `${info.configured.web_https ? "https" : "http"}://${location.hostname}:${info.configured.web_port}/#/settings` : location.href;
     toast("Сервер перезапускается…");
     setTimeout(() => { location.href = target; }, 4000);
+  };
+  $("#update-check").onclick = async (e) => {
+    const b = e.currentTarget;
+    b.disabled = true;
+    try {
+      const u = await api("POST", "/api/update/check");
+      renderUpdate({ ...u, enabled: true });
+      toast(u.available ? `Доступна версия ${u.latest.version}` : "Установлена последняя версия");
+      pollState();
+    } catch (err) { toast(err.message, true); }
+    finally { b.disabled = false; }
   };
   $("#backup-now").onclick = async (e) => {
     const b = e.currentTarget;

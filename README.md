@@ -1,5 +1,8 @@
 # Cisco AnyConnect Monitor
 
+[![Tests](https://github.com/bekzatv/cisco-anyconnect-monitor/actions/workflows/tests.yml/badge.svg)](https://github.com/bekzatv/cisco-anyconnect-monitor/actions/workflows/tests.yml)
+[![Latest release](https://img.shields.io/github/v/release/bekzatv/cisco-anyconnect-monitor)](https://github.com/bekzatv/cisco-anyconnect-monitor/releases/latest)
+
 Веб-панель и фоновый сборщик статистики для **SSL VPN (WebVPN / AnyConnect) на маршрутизаторах Cisco IOS**: кто сейчас подключён, кто и сколько работал, кто давно не заходит, у кого устаревший клиент, что происходит на самом роутере. Работает на Windows: на рабочем ПК или как служба на Windows Server.
 
 > **English summary.** A self-hosted web dashboard for SSL VPN (WebVPN/AnyConnect) on **Cisco IOS routers** (not ASA). It polls the router over SSH, stores every VPN session in SQLite and shows who is online, usage history per user, inactive and unused accounts, outdated AnyConnect clients, the router's own syslog, and sends Telegram alerts and weekly reports. Windows 10/11 or Windows Server 2016+. The UI is in Russian. MIT license.
@@ -39,6 +42,8 @@
 | Сессии | Аудит пользователей |
 |---|---|
 | ![Сессии](docs/screenshots/sessions.png) | ![Аудит пользователей](docs/screenshots/audit.png) |
+| **Копии конфигурации: что изменилось** | **Сотрудники и сроки доступа** |
+| ![Копии конфигурации](docs/screenshots/config-history.png) | ![Сотрудники](docs/screenshots/employees.png) |
 | **Карточка пользователя** | |
 | ![Карточка пользователя](docs/screenshots/user-card.png) | |
 | **Учётки на удаление** | **Журнал роутера** |
@@ -80,7 +85,14 @@ username vpnmonitor privilege 15 secret <пароль>
 
 ### 2. Запустите монитор
 
-**Вариант А — из исходников** (нужен Python 3.11+):
+**Вариант А — готовая сборка** (Python не нужен). На странице [Releases](https://github.com/bekzatv/cisco-anyconnect-monitor/releases/latest) скачайте:
+
+- `CiscoAnyConnectServer.exe` — чтобы запустить на своём компьютере: положите в отдельную папку и запустите, панель откроется на `http://127.0.0.1:8765/`;
+- `CiscoAnyConnectServer-…-server-package.zip` — чтобы поставить на Windows Server (см. [ниже](#установка-на-windows-server-круглосуточная-работа)).
+
+Файлы не подписаны, поэтому Windows SmartScreen при первом запуске может показать предупреждение. Контрольные суммы — в `SHA256SUMS.txt` рядом с файлами.
+
+**Вариант Б — из исходников** (нужен Python 3.11+):
 
 ```bat
 git clone https://github.com/bekzatv/cisco-anyconnect-monitor.git
@@ -89,7 +101,7 @@ python -m pip install -r requirements.txt
 python server.py --open
 ```
 
-**Вариант Б — собрать EXE** (ничего не нужно ставить на целевой машине):
+**Вариант В — собрать EXE самому:**
 
 ```bat
 Build-Exe.bat
@@ -125,7 +137,7 @@ python server.py --data-dir demo --open
 
 На рабочем ПК монитор останавливается вместе с компьютером. На сервере он работает задачей Планировщика от имени SYSTEM: стартует при загрузке системы без входа пользователя, а каждые 5 минут задача проверяет, что он жив, и поднимает его после сбоя.
 
-1. Соберите `dist\server-package\` (`Build-Exe.bat`) и скопируйте папку на сервер.
+1. Скачайте `CiscoAnyConnectServer-…-server-package.zip` со страницы [Releases](https://github.com/bekzatv/cisco-anyconnect-monitor/releases/latest) и распакуйте на сервере. Либо соберите `dist\server-package\` сами (`Build-Exe.bat`) и скопируйте папку.
 2. На сервере от имени администратора:
 
    ```bat
@@ -218,6 +230,7 @@ archive
 - **Защита веб-интерфейса:** cookie сессии `HttpOnly` и `SameSite=Strict`, CSRF-заголовок на изменяющих запросах, Content-Security-Policy, запрет встраивания во фреймы.
 - **Журнал роутера:** пароли, ключи и SNMP-community в записанных командах маскируются до сохранения.
 - **Доступ из сети** включайте только с HTTPS. Пароль и данные по HTTP идут открытым текстом.
+- **Проверка обновлений:** раз в сутки запрос к `api.github.com` за списком релизов; отключается в настройках.
 - **Геолокация:** для страны и провайдера внешние IP пользователей отправляются на [ipinfo.io](https://ipinfo.io) (без токена; результат кэшируется). Если это недопустимо, закройте серверу доступ в интернет — всё остальное продолжит работать.
 
 ## Настройки
@@ -237,6 +250,14 @@ archive
 | Копии конфигурации | вкл, 200 версий | раз в сутки и после каждого изменения |
 | Тревога о заполнении пула и лицензий | 80% | 0 — не предупреждать |
 | Сроки доступа | за 3 дня, в 9:00 | напоминание в Telegram |
+
+## Обновление
+
+Раз в сутки монитор спрашивает у GitHub, не вышла ли новая версия. Если вышла, в боковой панели появляется строка «Доступна версия …», а в журнал и Telegram приходит одно сообщение. Текущее состояние и кнопка «Проверить обновления» — в **Настройки → Сервер**.
+
+Сам монитор ничего не скачивает и не устанавливает. Чтобы обновиться, скачайте новый `server-package` со страницы [Releases](https://github.com/bekzatv/cisco-anyconnect-monitor/releases), распакуйте на сервере и запустите `Install-Server.bat` от имени администратора: база и настройки сохраняются, схема базы обновляется сама.
+
+На сервер GitHub уходит только запрос списка релизов этого репозитория, без каких-либо данных о вашей сети. Проверку можно выключить в **Настройки → Конфигурация и ёмкость**; без выхода в интернет монитор работает как обычно.
 
 ## Мониторинг самого монитора
 
@@ -272,6 +293,8 @@ archive
 - Интерфейс на русском языке.
 
 ## Разработка
+
+Тесты запускаются на GitHub при каждом коммите (`.github/workflows/tests.yml`). Чтобы выпустить версию, поднимите `__version__` в `vpnmon/__init__.py`, опишите изменения в `docs/release-notes.md` и отправьте тег `vX.Y`: `release.yml` соберёт EXE и опубликует релиз.
 
 ```bat
 python -m pip install -r requirements.txt

@@ -802,6 +802,7 @@ class Collector:
 
                 maybe_send_weekly_report(self, settings)
                 self.check_expiry(settings)
+                self.check_update(settings)
             except Exception:
                 log.exception("Служебные задачи")
 
@@ -839,6 +840,23 @@ class Collector:
         if settings.get("telegram_notify_alerts", True):
             self.telegram.send(settings, "⏳ " + text)
         return text
+
+    def check_update(self, settings: dict, force: bool = False) -> dict | None:
+        """Once a day: is there a newer release on GitHub? Journal and Telegram get it once per version."""
+        from .updates import check_due, check_for_update
+
+        if not force and not (settings.get("update_check_enabled", True)
+                              and check_due(self.store, int(time.time()))):
+            return None
+        state = check_for_update(self.store)
+        if state["is_new"]:
+            latest = state["latest"]
+            text = (f"Вышла новая версия VPN-монитора: {latest['version']} (установлена {state['current']}). "
+                    f"Скачать: {latest['url']}")
+            self.event("INFO", text)
+            self.telegram.send(settings, "⬆ " + text)
+        self.bump()
+        return state
 
     def _maybe_backup(self, settings: dict, force: bool = False) -> str:
         today = datetime.now().strftime("%Y-%m-%d")
