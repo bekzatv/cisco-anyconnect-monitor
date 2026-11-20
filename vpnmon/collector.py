@@ -34,7 +34,8 @@ from .config import (
     load_settings,
     router_creds,
 )
-from .geo import fetch_ipinfo, format_ip_summary, is_private_or_local_ip
+from .geo import GEO_CACHE_SECONDS, GEO_RETRY_SECONDS, fetch_ipinfo, format_ip_summary, geo_is_stale, \
+    is_private_or_local_ip
 from .routercfg import (
     CONFIG_COMMAND,
     LICENSE_COMMAND,
@@ -899,18 +900,25 @@ class Collector:
         except OSError:
             log.warning("Не удалось сохранить %s", IP_CACHE_FILE)
 
-    def enrich_geo(self, sessions: list[VpnSession]):
+    def enrich_geo(self, sessions: list[VpnSession], now: float | None = None):
+        now = time.time() if now is None else now
         for s in sessions:
             cached = self.ip_cache.get(s.ip)
             if cached:
                 s.country, s.org = format_ip_summary(cached)
+                # Addresses move between towns and owners; an old answer is shown until a fresh one arrives.
+                if geo_is_stale(cached, now):
+                    self._queue_geo(s.ip)
             elif is_private_or_local_ip(s.ip):
                 s.country, s.org = "LAN / Локальная", "Локальная сеть"
             else:
                 s.country = s.org = "Загрузка..."
-                if s.ip not in self._geo_inflight:
-                    self._geo_inflight.add(s.ip)
-                    self._geo_queue.put(s.ip)
+                self._queue_geo(s.ip)
+
+    def _queue_geo(self, ip: str):
+        if ip not in self._geo_inflight:
+            self._geo_inflight.add(ip)
+            self._geo_queue.put(ip)
 
     def _geo_worker(self):
         while True:
@@ -921,9 +929,15 @@ class Collector:
                 log.warning("Геолокация %s: %s", ip, exc)
                 data = None
             self._geo_inflight.discard(ip)
+            old = self.ip_cache.get(ip)
             if data:
+                data["_fetched"] = int(time.time())
                 self.ip_cache[ip] = data
                 self._save_ip_cache()
+            elif old:
+                # Refresh failed: keep the old answer and try again in an hour, not on every poll.
+                old["_fetched"] = int(time.time()) - GEO_CACHE_SECONDS + GEO_RETRY_SECONDS
+                continue
             loc, org = format_ip_summary(data) if data else ("—", "—")
             if data:
                 self.store.update_geo_for_ip(ip, loc, org)

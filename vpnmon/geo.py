@@ -5,7 +5,23 @@ import json
 import urllib.error
 import urllib.request
 
+from . import __version__
+
 IPINFO_URL = "https://ipinfo.io/{ip}/json"
+# Providers re-map address blocks and operators hand them to other towns, so answers are asked again.
+GEO_CACHE_SECONDS = 3 * 24 * 3600
+GEO_RETRY_SECONDS = 3600
+
+
+def geo_is_stale(entry: dict, now: float) -> bool:
+    """Entries written by older versions have no timestamp and are refreshed once."""
+    if entry.get("_private"):
+        return False
+    try:
+        fetched = float(entry.get("_fetched") or 0)
+    except (TypeError, ValueError):
+        fetched = 0
+    return now - fetched >= GEO_CACHE_SECONDS
 
 
 def is_private_or_local_ip(ip: str) -> bool:
@@ -43,7 +59,7 @@ def fetch_ipinfo(ip: str, timeout: int = 12) -> dict:
     url = IPINFO_URL.format(ip=ip)
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "CiscoAnyConnectMonitor/4.0"},
+        headers={"User-Agent": f"CiscoAnyConnectMonitor/{__version__}"},
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
