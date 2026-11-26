@@ -28,14 +28,15 @@ from .cisco import (
 from .config import (
     BACKUP_DIR,
     HISTORY_LOG_FILE,
+    GEOIP_DIR,
     IP_CACHE_FILE,
     decode_password,
     get_routers,
     load_settings,
     router_creds,
 )
-from .geo import GEO_CACHE_SECONDS, GEO_RETRY_SECONDS, fetch_ipinfo, format_ip_summary, geo_is_stale, \
-    is_private_or_local_ip
+from .geo import GEO_CACHE_SECONDS, GEO_RETRY_SECONDS, fetch_ipinfo, geo_is_stale, is_private_or_local_ip
+from .geodb import GeoAnswer, IpLabels, LocalGeoDB, merge_geo, parse_asns
 from .routercfg import (
     CONFIG_COMMAND,
     LICENSE_COMMAND,
@@ -231,7 +232,7 @@ class RouterPoller:
         self._last_logged_error = ""
         for s in sessions:
             s.router = self.id
-        c.enrich_geo(sessions)
+        c.enrich_geo(sessions, settings=settings)
         diff = c.store.record_snapshot(sessions, now_ts=now, router=self.id)
         counts = c.store.get_user_counts_map(days=90, now_ts=now)
         details = c.store.get_active_details(self.id)
@@ -467,6 +468,9 @@ class Collector:
         self.version = 0  # bumps on every change the web panel should pick up
 
         self.ip_cache: dict[str, dict] = self._load_ip_cache()
+        self.geodb = LocalGeoDB(GEOIP_DIR)
+        self.ip_labels = IpLabels(store.list_ip_labels())
+        self._geo_failed: dict[str, float] = {}
         self._geo_queue: queue.Queue[str] = queue.Queue()
         self._geo_inflight: set[str] = set()
         self._pending_geo_alerts: dict[str, list[VpnSession]] = {}
@@ -804,6 +808,7 @@ class Collector:
                 maybe_send_weekly_report(self, settings)
                 self.check_expiry(settings)
                 self.check_update(settings)
+                self.check_geo_db(settings)
             except Exception:
                 log.exception("Служебные задачи")
 
@@ -900,25 +905,67 @@ class Collector:
         except OSError:
             log.warning("Не удалось сохранить %s", IP_CACHE_FILE)
 
-    def enrich_geo(self, sessions: list[VpnSession], now: float | None = None):
+    def geo_answer(self, ip: str, settings: dict, now: float | None = None) -> GeoAnswer | None:
+        """Where the address is, from the labels, the local database and ipinfo.io. None while still asking."""
         now = time.time() if now is None else now
+        label = self.ip_labels.match(ip)
+        if is_private_or_local_ip(ip) and not label:
+            return GeoAnswer("LAN / Локальная", "Локальная сеть")
+        use_remote = settings.get("geo_ipinfo_enabled", True) and not is_private_or_local_ip(ip)
+        local = self.geodb.lookup(ip) if settings.get("geo_local_db_enabled", True) else None
+        remote = self.ip_cache.get(ip) if use_remote else None
+        if use_remote:
+            if remote is None and now - self._geo_failed.get(ip, 0) >= GEO_RETRY_SECONDS:
+                self._queue_geo(ip)
+            elif remote is not None and geo_is_stale(remote, now):
+                # Addresses move between towns and owners; the old answer is shown until a fresh one arrives.
+                self._queue_geo(ip)
+        answer = merge_geo(local, remote, label, parse_asns(settings.get("geo_mobile_asns")))
+        if answer is None:
+            return None if ip in self._geo_inflight else GeoAnswer("—", "—")
+        return answer
+
+    @staticmethod
+    def _apply_geo(s: VpnSession, answer: GeoAnswer | None):
+        if answer is None:
+            s.country = s.org = "Загрузка..."
+            s.geo_note = s.geo_detail = ""
+        else:
+            s.country, s.org, s.geo_note, s.geo_detail = answer.loc, answer.org, answer.note, answer.detail
+
+    def enrich_geo(self, sessions: list[VpnSession], now: float | None = None, settings: dict | None = None):
+        settings = settings if settings is not None else load_settings()
         for s in sessions:
-            cached = self.ip_cache.get(s.ip)
-            if cached:
-                s.country, s.org = format_ip_summary(cached)
-                # Addresses move between towns and owners; an old answer is shown until a fresh one arrives.
-                if geo_is_stale(cached, now):
-                    self._queue_geo(s.ip)
-            elif is_private_or_local_ip(s.ip):
-                s.country, s.org = "LAN / Локальная", "Локальная сеть"
-            else:
-                s.country = s.org = "Загрузка..."
-                self._queue_geo(s.ip)
+            self._apply_geo(s, self.geo_answer(s.ip, settings, now))
+
+    def regeo_all(self):
+        """After the database, the labels or the geo settings change."""
+        settings = load_settings()
+        for s in self.all_sessions():
+            self._apply_geo(s, self.geo_answer(s.ip, settings))
+        self.bump()
+
+    def reload_ip_labels(self):
+        self.ip_labels = IpLabels(self.store.list_ip_labels())
+        self.regeo_all()
 
     def _queue_geo(self, ip: str):
         if ip not in self._geo_inflight:
             self._geo_inflight.add(ip)
             self._geo_queue.put(ip)
+
+    def _store_remote(self, ip: str, data: dict | None, now: int):
+        old = self.ip_cache.get(ip)
+        if data:
+            data["_fetched"] = now
+            self.ip_cache[ip] = data
+            self._geo_failed.pop(ip, None)
+            self._save_ip_cache()
+        elif old:
+            # Refresh failed: keep the old answer and try again in an hour, not on every poll.
+            old["_fetched"] = now - GEO_CACHE_SECONDS + GEO_RETRY_SECONDS
+        else:
+            self._geo_failed[ip] = now
 
     def _geo_worker(self):
         while True:
@@ -928,27 +975,68 @@ class Collector:
             except Exception as exc:
                 log.warning("Геолокация %s: %s", ip, exc)
                 data = None
+            self._store_remote(ip, data, int(time.time()))
             self._geo_inflight.discard(ip)
-            old = self.ip_cache.get(ip)
-            if data:
-                data["_fetched"] = int(time.time())
-                self.ip_cache[ip] = data
-                self._save_ip_cache()
-            elif old:
-                # Refresh failed: keep the old answer and try again in an hour, not on every poll.
-                old["_fetched"] = int(time.time()) - GEO_CACHE_SECONDS + GEO_RETRY_SECONDS
-                continue
-            loc, org = format_ip_summary(data) if data else ("—", "—")
-            if data:
-                self.store.update_geo_for_ip(ip, loc, org)
+            settings = load_settings()
+            answer = self.geo_answer(ip, settings) or GeoAnswer("—", "—")
+            if answer.loc != "—":
+                self.store.update_geo_for_ip(ip, answer.loc, answer.org)
             for s in self.all_sessions():
                 if s.ip == ip:
-                    s.country, s.org = loc, org
-            settings = load_settings()
+                    self._apply_geo(s, answer)
             for s in self._pending_geo_alerts.pop(ip, []):
-                s.country, s.org = loc, org
+                self._apply_geo(s, answer)
                 self._check_new_country(settings, s)
             self.bump()
+
+    def geo_lookup(self, ip: str) -> dict:
+        """The admin's "check an address": every source side by side, ipinfo.io asked afresh."""
+        import ipaddress
+
+        ip = str(ipaddress.ip_address(ip.strip()))
+        settings = load_settings()
+        remote, remote_error = None, ""
+        if settings.get("geo_ipinfo_enabled", True) and not is_private_or_local_ip(ip):
+            try:
+                remote = fetch_ipinfo(ip, timeout=10)
+                self._store_remote(ip, remote, int(time.time()))
+            except Exception as exc:
+                remote_error = str(exc)
+                remote = self.ip_cache.get(ip)
+        answer = self.geo_answer(ip, settings) or GeoAnswer("—", "—")
+        local = self.geodb.lookup(ip) if settings.get("geo_local_db_enabled", True) else None
+        return {
+            "ip": ip,
+            "answer": answer.as_dict(),
+            "ipinfo": {k: v for k, v in (remote or {}).items() if not k.startswith("_") and k != "readme"},
+            "ipinfo_error": remote_error,
+            "dbip": local or {},
+            "label": self.ip_labels.match(ip),
+        }
+
+    # -- local database
+    def check_geo_db(self, settings: dict, force: bool = False) -> bool:
+        """Once a month fetch the new DB-IP files in the background. True when an update was started."""
+        if not settings.get("geo_local_db_enabled", True) or not self.geodb.supported or self.geodb.updating:
+            return False
+        if not force and not self.geodb.update_due(time.time()):
+            return False
+        self.geodb.updating = True
+        threading.Thread(target=self._update_geo_db, name="geodb", daemon=True).start()
+        return True
+
+    def _update_geo_db(self):
+        try:
+            installed = self.geodb.update()
+        except Exception as exc:
+            log.warning("Обновление базы геолокации: %s", exc)
+            self.bump()
+            return
+        if installed:
+            names = {"city": "города", "asn": "операторы"}
+            self.event("INFO", "База геолокации DB-IP обновлена: "
+                       + ", ".join(f"{names[k]} — {m}" for k, m in installed))
+        self.regeo_all()
 
     # ------------------------------------------------------------------ admin actions
     def find_session(self, router: str, context: str, login: str, ip: str) -> VpnSession | None:

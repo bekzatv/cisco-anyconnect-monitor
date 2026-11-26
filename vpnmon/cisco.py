@@ -70,6 +70,8 @@ class VpnSession:
     tunnel_ip: str = ""
     rx_packets: int = 0
     tx_packets: int = 0
+    geo_note: str = ""
+    geo_detail: str = ""
 
     def key(self) -> tuple[str, str, str]:
         return (self.context, self.login, self.ip)

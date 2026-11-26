@@ -11,6 +11,7 @@ known_hosts
 *.log
 backups/
 tls/
+geoip/
 vpnmon-transfer-*.zip
 
 # Build output

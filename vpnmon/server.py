@@ -28,6 +28,7 @@ from .cisco import CiscoConnection, VpnSession, clean_text, is_outdated
 from .cleanup import build_cleanup, mark_deleted_accounts
 from .collector import Collector, TelegramNotifier, parse_date
 from .routercfg import config_diff, mask_config
+from .geodb import normalize_cidr
 from .updates import update_state
 from .config import (
     BACKUP_DIR,
@@ -144,6 +145,9 @@ PUBLIC_SETTINGS |= {
     "expiry_warn_days": int,
     "expiry_notify_hour": int,
     "update_check_enabled": bool,
+    "geo_local_db_enabled": bool,
+    "geo_ipinfo_enabled": bool,
+    "geo_mobile_asns": list,
 }
 SETTING_DEFAULTS |= {
     "config_backup_enabled": True,
@@ -153,6 +157,9 @@ SETTING_DEFAULTS |= {
     "expiry_warn_days": 3,
     "expiry_notify_hour": 9,
     "update_check_enabled": True,
+    "geo_local_db_enabled": True,
+    "geo_ipinfo_enabled": True,
+    "geo_mobile_asns": [],
 }
 DIRECTORY_COLUMNS = ("login", "full_name", "department", "phone", "comment", "expires")
 # Column names accepted in an imported CSV header (case-insensitive).
@@ -182,6 +189,8 @@ ADMIN_ONLY = {
     ("GET", "/api/web-users"), ("POST", "/api/web-users/save"), ("POST", "/api/web-users/delete"),
     ("GET", "/api/configs/download"), ("POST", "/api/configs/backup"),
     ("POST", "/api/update/check"),
+    ("GET", "/api/geo/lookup"), ("POST", "/api/geo/update"),
+    ("POST", "/api/geo/labels/save"), ("POST", "/api/geo/labels/delete"),
     ("POST", "/api/directory/save"), ("POST", "/api/directory/delete"), ("POST", "/api/directory/import"),
 }
 
@@ -554,6 +563,11 @@ def make_handler(app: App):
                 ("POST", "/api/web-users/delete"): self.delete_web_user,
                 ("GET", "/api/update"): self.update_info,
                 ("POST", "/api/update/check"): self.update_check,
+                ("GET", "/api/geo"): self.geo_info,
+                ("GET", "/api/geo/lookup"): self.geo_lookup,
+                ("POST", "/api/geo/update"): self.geo_update,
+                ("POST", "/api/geo/labels/save"): self.geo_label_save,
+                ("POST", "/api/geo/labels/delete"): self.geo_label_delete,
                 ("GET", "/api/configs"): self.configs,
                 ("GET", "/api/configs/view"): self.config_view,
                 ("GET", "/api/configs/download"): self.config_download,
@@ -1048,8 +1062,15 @@ def make_handler(app: App):
 
         def save_settings(self, _q):
             changes = coerce_settings(self.read_json())
+            if "geo_mobile_asns" in changes:
+                bad = [x for x in changes["geo_mobile_asns"] if not re.fullmatch(r"(?i)(AS)?\d+", x)]
+                if bad:
+                    raise ApiError(400, f"Номер оператора — в виде AS29355 или 29355: {', '.join(bad)}")
             update_settings(changes)
             app.collector.event("ADMIN", f"Настройки изменены из веб-панели ({self.actor})")
+            if any(k.startswith("geo_") for k in changes):
+                app.collector.regeo_all()
+                app.collector.check_geo_db(load_settings())
             app.collector.refresh_now()
             self.send_json(public_settings(load_settings()))
 
@@ -1240,6 +1261,55 @@ def make_handler(app: App):
                 "certificate": certificate_info() if run["web_https"] else {},
                 "client_is_local": is_loopback(self.client_ip),
             })
+
+        # -------------------------------------------------------------- geolocation
+        def geo_info(self, _q):
+            self.send_json({
+                "db": app.collector.geodb.status(),
+                "labels": app.store.list_ip_labels(),
+                "local_enabled": setting(load_settings(), "geo_local_db_enabled"),
+            })
+
+        def geo_lookup(self, q):
+            try:
+                self.send_json(app.collector.geo_lookup(str(q.get("ip", ""))))
+            except ValueError:
+                raise ApiError(400, "Введите IP-адрес, например 95.82.117.76")
+
+        def geo_update(self, _q):
+            settings = load_settings()
+            if not setting(settings, "geo_local_db_enabled"):
+                raise ApiError(400, "Локальная база выключена в настройках")
+            if not app.collector.geodb.supported:
+                raise ApiError(400, "В этой сборке нет модуля maxminddb для чтения базы")
+            started = app.collector.check_geo_db(settings, force=True)
+            self.send_json({"started": started, "db": app.collector.geodb.status()})
+
+        def geo_label_save(self, _q):
+            data = self.read_json()
+            try:
+                cidr = normalize_cidr(data.get("cidr", ""))
+            except ValueError:
+                raise ApiError(400, "Адрес или сеть — в виде 10.1.2.3 или 10.1.2.0/24")
+            label = str(data.get("label", "")).strip()[:80]
+            if not label:
+                raise ApiError(400, "Введите подпись, например «Офис Астана»")
+            country = str(data.get("country", "")).strip().upper()
+            if country and not re.fullmatch(r"[A-Z]{2}", country):
+                raise ApiError(400, "Страна — двухбуквенный код, например KZ")
+            old = str(data.get("old_cidr", "")).strip()
+            app.store.save_ip_label(cidr, label, country, str(data.get("comment", "")).strip()[:200], old_cidr=old)
+            app.collector.event("ADMIN", f"Геолокация: сеть {cidr} подписана «{label}» ({self.actor})")
+            app.collector.reload_ip_labels()
+            self.send_json({"ok": True, "cidr": cidr})
+
+        def geo_label_delete(self, _q):
+            cidr = str(self.read_json().get("cidr", "")).strip()
+            removed = app.store.delete_ip_label(cidr)
+            if removed:
+                app.collector.event("ADMIN", f"Геолокация: подпись сети {cidr} удалена ({self.actor})")
+                app.collector.reload_ip_labels()
+            self.send_json({"removed": removed})
 
         def update_info(self, _q):
             self.send_json(update_state(app.store) | {

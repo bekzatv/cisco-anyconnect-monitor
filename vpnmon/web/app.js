@@ -534,7 +534,7 @@ function renderSessions() {
       <td><span class="live"></span><a href="#" class="login link" data-user="${esc(s.login)}">${esc(s.login)}</a>${multiIp ? ` <span class="tag warn" title="Одновременно с нескольких IP">${ipsByLogin[s.login.toLowerCase()].size} IP</span>` : ""}${personLine(s.login)}</td>
       <td class="col-router ${multi ? "" : "hidden"}">${esc(s.router_name)}</td>
       <td class="mono" title="${s.tunnel_ip ? `IP в туннеле: ${esc(s.tunnel_ip)}` : ""}">${esc(s.ip)}</td>
-      <td>${esc(s.country)}</td>
+      <td title="${esc(s.geo_detail || "")}">${geoCell(s)}</td>
       <td class="ellipsis" title="${esc(s.org)}">${esc(s.org)}</td>
       <td>${clientLabel(s)}</td>
       <td class="num" title="Принято ${fmtNum(s.rx_packets)} / отправлено ${fmtNum(s.tx_packets)} пакетов">${s.packets ? `${fmtCount(s.rx_packets)} / ${fmtCount(s.tx_packets)}` : `<span class="muted">—</span>`}</td>
@@ -951,6 +951,7 @@ async function loadSettings() {
     loadRouters();
     loadWebUsers();
     loadServerInfo();
+    loadGeo();
     const rep = await api("GET", "/api/report/preview");
     $("#report-last").textContent = rep.last_sent_ts ? `Последний отчёт отправлен ${fmtTs(rep.last_sent_ts)}.` : "Отчёт ещё не отправлялся.";
   } catch (err) { toast(err.message, true); }
@@ -1022,6 +1023,139 @@ async function saveSettings(e) {
     loadSettings();
     setTimeout(pollState, 3000);
   } catch (err) { toast(err.message, true); }
+}
+
+// ---------------------------------------------------------------- geolocation
+function geoCell(s) {
+  const notes = (s.geo_note || "").split(" ");
+  if (notes.includes("label")) return `<span class="geo-label">${esc(s.country)}</span>`;
+  let out = esc(s.country);
+  if (notes.includes("conflict")) out += ` <span class="geo-tag warn">?</span>`;
+  if (notes.includes("mobile")) out += ` <span class="geo-tag">моб.</span>`;
+  return out;
+}
+
+const MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"];
+const fmtMonth = (m) => /^\d{4}-\d{2}$/.test(m || "") && m !== "0000-00" ? `${MONTHS[Number(m.slice(5)) - 1]} ${m.slice(0, 4)}` : "";
+
+let geoLabelsCache = [];
+async function loadGeo() {
+  try {
+    const g = await api("GET", "/api/geo");
+    renderGeoDb(g.db, g.local_enabled);
+    geoLabelsCache = g.labels;
+    $("#gl-table tbody").innerHTML = g.labels.length ? g.labels.map((l, i) => `<tr>
+      <td class="mono">${esc(l.cidr)}</td><td><b>${esc(l.label)}</b></td><td>${esc(l.country || "—")}</td>
+      <td class="muted">${esc(l.comment || "")}</td>
+      <td class="actions"><button class="btn sm" type="button" data-gledit="${i}">Изменить</button><button class="icon-btn danger" type="button" data-gldel="${i}" title="Удалить">✕</button></td>
+    </tr>`).join("") : `<tr><td colspan="5" class="muted">Подписей пока нет</td></tr>`;
+  } catch (err) { toast(err.message, true); }
+}
+
+function renderGeoDb(db, enabled) {
+  const el = $("#geo-db-info");
+  $("#geo-db-update").disabled = !enabled || !db.supported || db.updating;
+  if (!db.supported) { el.innerHTML = `<span class="warn-text">В этой сборке нет модуля для чтения базы — работает только ipinfo.io.</span>`; return; }
+  if (!enabled) { el.innerHTML = `<span class="muted">Локальная база выключена.</span>`; return; }
+  const parts = [];
+  if (db.updating) parts.push(`<span class="muted">Скачивается новая база…</span>`);
+  if (db.available) {
+    const mb = (n) => `${Math.round(n / 1048576)} МБ`;
+    parts.push(`<span class="ok-text">База установлена:</span> города — ${esc(fmtMonth(db.files.city.month) || "есть")} (${mb(db.files.city.size)}), операторы — ${esc(fmtMonth(db.files.asn.month) || (db.files.asn.size ? "есть" : "нет"))}.`);
+  } else if (!db.updating) {
+    parts.push(`<span class="muted">Базы ещё нет: она скачается в течение минуты после включения.</span>`);
+  }
+  if (db.error) parts.push(`<span class="warn-text">Последняя загрузка не удалась: ${esc(db.error)}. Без интернета на сервере файлы можно положить в <code>${esc(db.folder)}</code> вручную.</span>`);
+  el.innerHTML = parts.join(" ");
+  if (db.updating) setTimeout(loadGeo, 5000);
+}
+
+function resetGeoLabelForm() {
+  const f = $("#gl-form");
+  f.reset();
+  f.old_cidr.value = "";
+  $("#gl-submit").textContent = "Добавить";
+  $("#gl-cancel").classList.add("hidden");
+}
+
+function renderGeoLookup(r) {
+  const a = r.answer;
+  const row = (name, value) => `<tr><td class="muted">${esc(name)}</td><td>${value}</td></tr>`;
+  const ii = r.ipinfo || {}, db = r.dbip || {};
+  const rows = [
+    row("Монитор покажет", `<b>${geoCell({ country: a.loc, geo_note: a.note })}</b> · ${esc(a.org)}`),
+    row("ipinfo.io", r.ipinfo_error ? `<span class="warn-text">${esc(r.ipinfo_error)}</span>`
+      : ii.ip ? esc([ii.country, ii.region, ii.city].filter(Boolean).join(", ") + (ii.org ? ` · ${ii.org}` : "")) : `<span class="muted">не спрашивали</span>`),
+    row("DB-IP", db.country || db.asn ? esc([db.country, db.region, db.city].filter(Boolean).join(", ") + (db.asn ? ` · AS${db.asn} ${db.org || ""}` : "")) : `<span class="muted">нет данных</span>`),
+  ];
+  if (r.label) rows.push(row("Своя подпись", `${esc(r.label.label)} (${esc(r.label.cidr)})`));
+  // The per-source lines are already in the table above; keep only the explanations.
+  const notes = (a.detail || "").split("\n").filter((l) => l && !/^(ipinfo\.io|DB-IP|Своя подпись):?/.test(l));
+  $("#gq-result").innerHTML = `<table class="table compact">${rows.join("")}</table>`
+    + (notes.length ? `<p class="muted">${notes.map(esc).join("<br>")}</p>` : "")
+    + `<button class="btn sm" type="button" id="gq-label" data-ip="${esc(r.ip)}">Подписать этот адрес</button>`;
+}
+
+function bindGeo() {
+  $("#geo-db-update").onclick = async (e) => {
+    const b = e.currentTarget;
+    b.disabled = true;
+    try {
+      const r = await api("POST", "/api/geo/update");
+      toast(r.started ? "Загрузка базы началась" : "База уже загружается");
+      renderGeoDb(r.db, true);
+      setTimeout(loadGeo, 3000);
+    } catch (err) { toast(err.message, true); b.disabled = false; }
+  };
+  $("#gl-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const body = Object.fromEntries(["cidr", "label", "country", "comment", "old_cidr"].map((k) => [k, f[k].value.trim()]));
+    try {
+      await api("POST", "/api/geo/labels/save", body);
+      toast("Подпись сохранена");
+      resetGeoLabelForm();
+      loadGeo();
+      pollState();
+    } catch (err) { toast(err.message, true); }
+  };
+  $("#gl-cancel").onclick = resetGeoLabelForm;
+  $("#gl-table tbody").onclick = async (e) => {
+    const edit = e.target.closest("[data-gledit]"), del = e.target.closest("[data-gldel]");
+    if (edit) {
+      const l = geoLabelsCache[Number(edit.dataset.gledit)], f = $("#gl-form");
+      for (const k of ["cidr", "label", "country", "comment"]) f[k].value = l[k] || "";
+      f.old_cidr.value = l.cidr;
+      $("#gl-submit").textContent = "Сохранить";
+      $("#gl-cancel").classList.remove("hidden");
+      f.label.focus();
+    } else if (del) {
+      const l = geoLabelsCache[Number(del.dataset.gldel)];
+      if (!confirm(`Удалить подпись «${l.label}» для ${l.cidr}?`)) return;
+      try {
+        await api("POST", "/api/geo/labels/delete", { cidr: l.cidr });
+        toast("Подпись удалена");
+        loadGeo();
+        pollState();
+      } catch (err) { toast(err.message, true); }
+    }
+  };
+  $("#gq-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const ip = e.target.ip.value.trim();
+    $("#gq-result").innerHTML = `<p class="muted">Проверяю…</p>`;
+    try { renderGeoLookup(await api("GET", `/api/geo/lookup?ip=${encodeURIComponent(ip)}`)); }
+    catch (err) { $("#gq-result").innerHTML = `<p class="error-text">${esc(err.message)}</p>`; }
+  };
+  $("#gq-result").onclick = (e) => {
+    const b = e.target.closest("#gq-label");
+    if (!b) return;
+    resetGeoLabelForm();
+    const f = $("#gl-form");
+    f.cidr.value = b.dataset.ip;
+    f.label.focus();
+    f.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
 }
 
 // ---------------------------------------------------------------- routers
@@ -1386,6 +1520,7 @@ function wire() {
 
   // settings
   $("#settings-form").onsubmit = saveSettings;
+  bindGeo();
   $("#r-add").onclick = () => editRouter({});
   $("#r-table tbody").onclick = (e) => {
     const edit = e.target.closest("[data-edit]");

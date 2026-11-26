@@ -21,8 +21,8 @@ CHECK_EVERY_SECONDS = 24 * 3600
 RETRY_SECONDS = 6 * 3600
 
 
-def is_newer(latest: str, current: str = __version__) -> bool:
-    a, b = version_tuple(latest), version_tuple(current)
+def is_newer(latest: str, current: str | None = None) -> bool:
+    a, b = version_tuple(latest), version_tuple(current or __version__)
     if not a or not b:
         return False
     n = max(len(a), len(b))

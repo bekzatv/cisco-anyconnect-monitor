@@ -16,7 +16,7 @@ from .config import STATS_DB_FILE
 
 log = logging.getLogger("vpnmon.storage")
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 DEFAULT_ROUTER_ID = "main"
 
 # A session counts as a reconnect when it starts at most RECONNECT_MAX_GAP seconds after the
@@ -281,6 +281,22 @@ class ConnectionStatsStore:
                     """
                 )
                 conn.execute("PRAGMA user_version = 6")
+                conn.commit()
+        if version < 7:
+            # v7: the admin's own names for networks (office, branch, someone's home).
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ip_labels (
+                        cidr TEXT PRIMARY KEY,
+                        label TEXT NOT NULL,
+                        country TEXT DEFAULT '',
+                        comment TEXT DEFAULT '',
+                        updated_ts INTEGER DEFAULT 0
+                    )
+                    """
+                )
+                conn.execute("PRAGMA user_version = 7")
                 conn.commit()
 
     # -------------------------------------------------------------------------
@@ -1097,6 +1113,39 @@ class ConnectionStatsStore:
         with self._lock:
             with self._connect() as conn:
                 cur = conn.execute("DELETE FROM directory WHERE login = ? COLLATE NOCASE", (login.strip(),))
+                conn.commit()
+                return cur.rowcount or 0
+
+    # -------------------------------------------------------------------------
+    # Network labels
+    # -------------------------------------------------------------------------
+    def list_ip_labels(self) -> list[dict]:
+        with self._lock:
+            try:
+                with self._connect() as conn:
+                    return [dict(r) for r in conn.execute("SELECT * FROM ip_labels ORDER BY label COLLATE NOCASE")]
+            except Exception:
+                log.exception("list_ip_labels")
+                return []
+
+    def save_ip_label(self, cidr: str, label: str, country: str = "", comment: str = "",
+                      old_cidr: str = "", now_ts: int | None = None):
+        now_ts = now_ts if now_ts is not None else int(time.time())
+        with self._lock:
+            with self._connect() as conn:
+                if old_cidr and old_cidr != cidr:
+                    conn.execute("DELETE FROM ip_labels WHERE cidr = ?", (old_cidr,))
+                conn.execute(
+                    "INSERT OR REPLACE INTO ip_labels (cidr, label, country, comment, updated_ts) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (cidr, label, country, comment, now_ts),
+                )
+                conn.commit()
+
+    def delete_ip_label(self, cidr: str) -> int:
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute("DELETE FROM ip_labels WHERE cidr = ?", (cidr,))
                 conn.commit()
                 return cur.rowcount or 0
 
