@@ -11,6 +11,7 @@
     каждые 5 минут (если сервер упал — поднимется; если работает — второй экземпляр не стартует);
   - открывает порт панели в брандмауэре (кроме режима -LocalOnly).
   Повторный запуск без -Bundle обновляет программу и не трогает данные.
+  Дальше обновлять можно одной командой: Update-Server.ps1 в папке программы.
 
 .EXAMPLE
   .\Install-Server.ps1 -Bundle C:\Temp\vpnmon-transfer.zip
@@ -112,6 +113,16 @@ Step 'Остановка запущенного CiscoAnyConnectServer.exe из �
 Step "Копирование программы в $InstallDir" {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     Copy-Item -Force $Exe $Target
+    # The updater and the version it compares against live next to the program.
+    foreach ($name in 'Update-Server.ps1', 'Update-Server.bat', 'Install-Server.ps1', 'Uninstall-Server.ps1', 'version.txt') {
+        $src = Join-Path $ScriptDir $name
+        $dst = Join-Path $InstallDir $name
+        if ((Test-Path $src) -and ((Resolve-Path $src).Path -ne $dst)) { Copy-Item -Force $src $dst }
+    }
+    # Update-Server.ps1 installs later versions with the same options.
+    $options = [ordered]@{ Port = $Port; SyslogPort = $SyslogPort; SyslogFrom = $SyslogFrom; LocalOnly = [bool]$LocalOnly }
+    [IO.File]::WriteAllText((Join-Path $InstallDir 'install-options.json'), ($options | ConvertTo-Json),
+        (New-Object Text.UTF8Encoding $false))
 }
 Step "Папка данных $DataDir (доступ: SYSTEM и администраторы)" {
     New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
@@ -190,7 +201,9 @@ if ($s -and $s.web_https) { $scheme = 'https' }
 Write-Host ''
 Write-Host 'Готово.' -ForegroundColor Green
 Write-Host "Панель: ${scheme}://$($env:COMPUTERNAME):$Port/  (и ${scheme}://127.0.0.1:$Port/ на самом сервере)"
+Write-Host "Обновлять дальше: & `"$(Join-Path $InstallDir 'Update-Server.ps1')`"  (от имени администратора)"
 Write-Host ''
+if (-not $firstInstall -and -not $Bundle) { return }
 Write-Host 'Дальше:'
 Write-Host '  1. Откройте панель, войдите прежним паролем (или задайте новый — только с самого сервера).'
 Write-Host '  2. Настройки -> Устройства Cisco -> Изменить: введите пароли роутеров заново.'

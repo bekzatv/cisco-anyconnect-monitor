@@ -26,6 +26,7 @@ rem Everything to copy to the Windows Server in one folder
 if not exist "dist\server-package" mkdir "dist\server-package"
 copy /y "dist\CiscoAnyConnectServer.exe" "dist\server-package\" >nul
 copy /y "server-install\*.*" "dist\server-package\" >nul
+"%PYTHON_EXE%" -c "import vpnmon; print(vpnmon.__version__)" > "dist\server-package\version.txt"
 echo.
 echo Build complete: dist\CiscoAnyConnectMonitor.exe, dist\CiscoAnyConnectServer.exe
 echo Server package: dist\server-package\

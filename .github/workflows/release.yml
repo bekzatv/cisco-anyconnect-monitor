@@ -53,6 +53,7 @@ jobs:
           New-Item -ItemType Directory -Force dist\server-package | Out-Null
           Copy-Item dist\CiscoAnyConnectServer.exe dist\server-package\
           Copy-Item server-install\* dist\server-package\
+          Set-Content dist\server-package\version.txt $env:VERSION -NoNewline
           Compress-Archive -Path dist\server-package\* -DestinationPath "dist\CiscoAnyConnectServer-$env:VERSION-server-package.zip"
           Get-FileHash dist\*.zip, dist\*.exe -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |

@@ -962,7 +962,7 @@ function renderUpdate(u) {
   if (u.available) {
     el.innerHTML = `<b class="warn-text">Доступна версия ${esc(u.latest.version)}</b>${u.latest.published ? ` от ${esc(fmtIsoDate(u.latest.published))}` : ""} — установлена ${esc(u.current)}. `
       + `<a class="link" target="_blank" rel="noopener noreferrer" href="${esc(u.latest.url)}">Что нового и загрузка →</a><br>`
-      + `<span class="muted">Чтобы обновить: скачайте архив server-package, распакуйте на сервере и запустите Install-Server.bat от имени администратора. База и настройки сохранятся.</span>`;
+      + `<span class="muted">Чтобы обновить, на сервере запустите от имени администратора <code>Update-Server.bat</code> из папки программы (обычно <code>C:\\Program Files\\CiscoAnyConnectMonitor</code>). Он сам скачает и поставит новую версию, база и настройки сохранятся.</span>`;
   } else if (u.error && !u.checked_ts) {
     el.innerHTML = `<span class="muted">Проверить обновления не удалось (${esc(u.error)}). Если у сервера нет выхода в интернет, смотрите новые версии на <a class="link" target="_blank" rel="noopener noreferrer" href="${esc(u.releases_url)}">странице релизов</a>.</span>`;
   } else if (!u.checked_ts) {
